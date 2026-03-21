@@ -1,0 +1,124 @@
+app:
+  name: drone_cv
+  log_level: INFO
+
+runtime:
+  telemetry_interval_s: 0.5
+  frame_interval_s: 0.2
+  vision_interval_s: 0.2
+  mission_interval_s: 0.2
+  control_interval_s: 0.2
+  run_duration_s: 3.0
+
+local_ui:
+  enabled: true
+  interval_s: 0.03
+  window_name: "drone_cv local"
+
+local_world:
+  width_m: 10.0
+  height_m: 8.0
+  marker_x_m: 6.0
+  marker_y_m: 0.0
+  obstacle_x_m: 3.2
+  obstacle_y_m: 0.6
+  obstacle_radius_m: 0.55
+  camera_fov_deg: 70.0
+  marker_scale_px_m: 260.0
+  desired_altitude_m: 1.2
+  min_altitude_m: 0.15
+  max_altitude_m: 3.0
+
+recording:
+  output_dir: "artifacts"
+  save_debug_frames: true
+  debug_frame_interval_s: 1.0
+
+airsim:
+  host: "127.0.0.1"
+  port: 41451
+  vehicle_name: ""
+  timeout_seconds: 10.0
+  takeoff_timeout_seconds: 20.0
+  land_timeout_seconds: 30.0
+  smoke_test_hover_duration_seconds: 2.0
+
+camera:
+  rgb_camera_name: "front_center"
+  depth_camera_name: "front_center"
+  image_width: 640
+  image_height: 480
+  debug_output_dir: "debug_frames"
+
+aruco:
+  dictionary: "DICT_4X4_50"
+  marker_id: 0
+  marker_length_m: 0.2
+
+control:
+  loop_hz: 10.0
+  max_velocity_xy: 1.0
+  max_velocity_z: 0.5
+  yaw_rate_deg_s: 15.0
+  servo_command_duration_s: 0.2
+  servo_max_lateral_velocity_m_s: 0.5
+  servo_max_vertical_velocity_m_s: 0.4
+  servo_max_yaw_rate_deg_s: 10.0
+  servo_yaw_error_deadband_px: 10.0
+  servo_lateral_kp: 0.4
+  servo_lateral_ki: 0.0
+  servo_lateral_kd: 0.05
+  servo_vertical_kp: 0.35
+  servo_vertical_ki: 0.0
+  servo_vertical_kd: 0.04
+  servo_yaw_kp: 5.0
+  servo_yaw_ki: 0.0
+  servo_yaw_kd: 0.2
+  approach_center_tolerance_px: 30.0
+  approach_target_marker_area: 12000.0
+  approach_forward_speed_m_s: 0.4
+  approach_command_duration_s: 0.25
+
+depth:
+  obstacle_distance_m: 2.0
+  min_valid_depth_m: 0.2
+  max_valid_depth_m: 20.0
+  avoidance_speed_m_s: 0.5
+  avoidance_yaw_rate_deg_s: 12.0
+  avoidance_command_duration_s: 0.25
+
+landing:
+  final_descent_rate_m_s: 0.3
+  touchdown_altitude_m: 0.15
+  alignment_tolerance_px: 24.0
+  final_marker_area: 22000.0
+  descend_step_duration_s: 0.25
+  lost_marker_limit: 3
+  loop_pause_s: 0.1
+  max_steps: 80
+
+telemetry:
+  poll_interval_s: 0.5
+  sample_count: 10
+
+overlays:
+  mode: "image"
+  output_dir: "debug_overlays"
+  output_filename: "overlay_debug.png"
+  window_name: "drone_cv overlay"
+  mission_state: "idle"
+
+mission:
+  search_yaw_rate_deg_s: 8.0
+  search_step_duration_s: 0.35
+  search_timeout_s: 20.0
+  track_timeout_s: 30.0
+  total_timeout_s: 90.0
+  marker_lost_limit: 3
+  descend_marker_area_threshold: 18000.0
+  descend_rate_m_s: 0.2
+  descend_step_duration_s: 0.25
+  landing_altitude_m: 0.4
+  complete_wait_s: 2.0
+  loop_pause_s: 0.1
+  max_steps: 100
