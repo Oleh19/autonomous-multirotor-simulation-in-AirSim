@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import re
+from pathlib import Path
 from typing import Any
 
 from telemetry.models import Quaternion, TelemetrySnapshot, Vector3
@@ -55,19 +57,28 @@ class AirSimClientAdapter:
         self.config = config
         self.logger = logger or logging.getLogger("drone_cv.airsim")
         self._client: Any | None = None
+        self._resolved_host = config.host
 
     def connect(self) -> None:
         client_cls = self._require_airsim()
+        resolved_host = self._resolve_host(self.config.host)
+        self._resolved_host = resolved_host
         self._client = client_cls(
-            ip=self.config.host,
+            ip=resolved_host,
             port=self.config.port,
             timeout_value=self.config.timeout_seconds,
         )
         self.logger.info(
             "Connecting to AirSim at %s:%s",
-            self.config.host,
+            resolved_host,
             self.config.port,
         )
+        if resolved_host != self.config.host:
+            self.logger.info(
+                "AirSim host was auto-resolved from '%s' to '%s'",
+                self.config.host,
+                resolved_host,
+            )
 
     def confirm_connection(self) -> None:
         client = self._require_client()
@@ -240,6 +251,35 @@ class AirSimClientAdapter:
         if self._client is None:
             raise RuntimeError("AirSim client is not connected. Call connect() first.")
         return self._client
+
+    @classmethod
+    def _resolve_host(cls, configured_host: str) -> str:
+        normalized = configured_host.strip().lower()
+        if normalized not in {"auto", "wsl", "wsl-host", "auto-wsl"}:
+            return configured_host
+
+        nameserver_ip = cls._read_wsl_nameserver()
+        if nameserver_ip:
+            return nameserver_ip
+
+        return "127.0.0.1"
+
+    @staticmethod
+    def _read_wsl_nameserver() -> str | None:
+        resolv_conf = Path("/etc/resolv.conf")
+        if not resolv_conf.exists():
+            return None
+
+        try:
+            content = resolv_conf.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+        for line in content.splitlines():
+            match = re.match(r"^\s*nameserver\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s*$", line)
+            if match:
+                return match.group(1)
+        return None
 
     @staticmethod
     def _require_airsim() -> Any:

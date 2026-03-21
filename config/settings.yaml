@@ -8,12 +8,17 @@ runtime:
   vision_interval_s: 0.2
   mission_interval_s: 0.2
   control_interval_s: 0.2
-  run_duration_s: 3.0
+  run_duration_s: 120.0
 
 local_ui:
   enabled: true
   interval_s: 0.03
   window_name: "drone_cv local"
+
+dev_ui:
+  enabled: true
+  interval_s: 0.03
+  window_name: "drone_cv dev"
 
 local_world:
   width_m: 10.0
@@ -35,17 +40,18 @@ recording:
   debug_frame_interval_s: 1.0
 
 airsim:
-  host: "127.0.0.1"
+  host: "172.20.128.1"
   port: 41451
   vehicle_name: ""
-  timeout_seconds: 10.0
-  takeoff_timeout_seconds: 20.0
-  land_timeout_seconds: 30.0
+  timeout_seconds: 60.0
+  takeoff_timeout_seconds: 60.0
+  land_timeout_seconds: 60.0
+  auto_takeoff_on_start: true
   smoke_test_hover_duration_seconds: 2.0
 
 camera:
-  rgb_camera_name: "front_center"
-  depth_camera_name: "front_center"
+  rgb_camera_name: "0"
+  depth_camera_name: "0"
   image_width: 640
   image_height: 480
   debug_output_dir: "debug_frames"

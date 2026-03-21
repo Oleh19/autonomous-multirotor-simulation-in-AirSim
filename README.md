@@ -52,10 +52,25 @@ python -m app.main --mode local
    Default:
 ```yaml
 airsim:
-  host: "127.0.0.1"
+  host: "auto"
   port: 41451
 ```
 3. Place an ArUco marker in view of the configured camera if you want to test tracking and landing flows.
+
+### WSL + Windows AirSim (no Unreal Engine required)
+
+1. On Windows, download and run a prebuilt AirSim environment (for example `Blocks.exe`).
+2. Keep `config/settings.yaml` with `airsim.host: "auto"`.
+   In WSL this auto-resolves the Windows host IP from `/etc/resolv.conf`.
+3. Run smoke test from WSL:
+```bash
+source .venv/bin/activate
+python -m app.main --mode smoke
+```
+4. If smoke is successful, run full dev loop:
+```bash
+python -m app.main --mode dev
+```
 
 ## Run The App
 
@@ -68,6 +83,13 @@ Local development mode:
 ```bash
 python -m app.main --mode dev
 ```
+
+`dev` mode opens an OpenCV window by default and supports manual override:
+- `A` / `D`: yaw left / right
+- `W` / `S`: altitude up / down
+- `J` / `L`: strafe left / right
+- `Space`: pause/resume automatic yaw behavior
+- `Q` or `Esc`: stop runtime and close the window
 
 Smoke mode:
 ```bash

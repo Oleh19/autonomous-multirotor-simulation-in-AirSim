@@ -259,30 +259,124 @@ async def control_loop(
     interval_s: float,
 ) -> None:
     from mission.states import MissionState
+    from telemetry.models import RuntimeControlCommand
 
     while True:
         async with state_lock:
             command = shared_state.desired_command
             mission_state = shared_state.mission_state
             already_applied = shared_state.control_applied
+            manual_yaw_rate_deg_s = shared_state.local_manual_yaw_rate_deg_s
+            manual_vz_m_s = shared_state.local_manual_vz_m_s
+            manual_vy_m_s = shared_state.local_manual_vy_m_s
+            manual_override_until_s = shared_state.local_manual_override_until_s
+            manual_status = shared_state.local_manual_status
+            spin_paused = shared_state.local_spin_paused
 
         if not already_applied:
-            if mission_state == MissionState.LAND:
+            manual_active = time.monotonic() < manual_override_until_s
+            effective_command = command
+
+            if manual_active:
+                manual_vx = 0.0 if manual_status in {"strafe_left", "strafe_right"} else command.vx
+                effective_command = RuntimeControlCommand(
+                    vx=manual_vx,
+                    vy=manual_vy_m_s if manual_status in {"strafe_left", "strafe_right"} else command.vy,
+                    vz=manual_vz_m_s if manual_status in {"up", "down", "hold"} else command.vz,
+                    yaw_rate=manual_yaw_rate_deg_s,
+                    duration_s=max(command.duration_s, interval_s),
+                    source=command.source,
+                    reason=f"{command.reason} | manual yaw {manual_status}",
+                )
+            elif spin_paused:
+                effective_command = RuntimeControlCommand(
+                    vx=command.vx,
+                    vy=command.vy,
+                    vz=command.vz,
+                    yaw_rate=0.0,
+                    duration_s=max(command.duration_s, interval_s),
+                    source=command.source,
+                    reason=f"{command.reason} | auto spin paused",
+                )
+
+            if mission_state == MissionState.LAND and not manual_active:
                 await asyncio.to_thread(adapter.land)
-            elif mission_state == MissionState.IDLE:
+            elif mission_state == MissionState.IDLE and not manual_active:
                 await asyncio.to_thread(adapter.hover)
             else:
                 await asyncio.to_thread(
                     adapter.move_by_velocity_body,
-                    command.vx,
-                    command.vy,
-                    command.vz,
-                    max(command.duration_s, interval_s),
-                    command.yaw_rate,
+                    effective_command.vx,
+                    effective_command.vy,
+                    effective_command.vz,
+                    max(effective_command.duration_s, interval_s),
+                    effective_command.yaw_rate,
                 )
             async with state_lock:
                 shared_state.control_applied = True
-            logger.info("Control loop | state=%s command=%s", mission_state.value, command.reason)
+            logger.info(
+                "Control loop | state=%s manual=%s vx=%.3f vy=%.3f vz=%.3f yaw_rate=%.3f command=%s",
+                mission_state.value,
+                manual_active,
+                effective_command.vx,
+                effective_command.vy,
+                effective_command.vz,
+                effective_command.yaw_rate,
+                effective_command.reason,
+            )
+        await asyncio.sleep(interval_s)
+
+
+async def dev_ui_loop(
+    shared_state,
+    state_lock: asyncio.Lock,
+    logger,
+    interval_s: float,
+    window_name: str,
+) -> None:
+    import cv2
+    import numpy as np
+
+    while True:
+        async with state_lock:
+            frames = shared_state.frames
+            detection = shared_state.detection
+            depth_analysis = shared_state.depth_analysis
+            mission_state = shared_state.mission_state
+            mission_detail = shared_state.mission_detail
+            command = shared_state.desired_command
+            telemetry = shared_state.telemetry
+            manual_override_until_s = shared_state.local_manual_override_until_s
+            spin_paused = shared_state.local_spin_paused
+
+        frame = None
+        if frames is not None and frames.rgb_frame is not None:
+            frame = frames.rgb_frame.copy()
+        if frame is None:
+            frame = np.full((480, 640, 3), 24, dtype=np.uint8)
+
+        _draw_dev_camera_overlay(
+            frame_bgr=frame,
+            mission_state=mission_state.value,
+            mission_detail=mission_detail,
+            command_reason=command.reason,
+            marker_detected=detection.detected if detection is not None else False,
+            obstacle_detected=depth_analysis.obstacle_detected if depth_analysis is not None else False,
+            altitude_m=telemetry.altitude_m if telemetry is not None else 0.0,
+            steering_mode=(
+                "manual"
+                if time.monotonic() < manual_override_until_s
+                else ("paused" if spin_paused else "auto")
+            ),
+        )
+        cv2.imshow(window_name, frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key in {27, ord("q"), ord("Q")}:
+            logger.info("Dev UI loop requested shutdown")
+            return
+        if key != 255:
+            await _apply_manual_key_input(shared_state, state_lock, key)
         await asyncio.sleep(interval_s)
 
 
@@ -293,6 +387,7 @@ async def run_runtime() -> int:
     app_name = settings["app"]["name"]
     runtime = settings.get("runtime", {})
     airsim_settings = settings.get("airsim", {})
+    dev_ui_settings = settings.get("dev_ui", {})
 
     logger.info("Starting %s asyncio runtime", app_name)
     print(f"{app_name} startup complete")
@@ -313,6 +408,11 @@ async def run_runtime() -> int:
         await asyncio.to_thread(adapter.confirm_connection)
         await asyncio.to_thread(adapter.enable_api_control, True)
         await asyncio.to_thread(adapter.arm, True)
+        if bool(airsim_settings.get("auto_takeoff_on_start", True)):
+            await asyncio.to_thread(
+                adapter.takeoff,
+                float(airsim_settings.get("takeoff_timeout_seconds", 20.0)),
+            )
     except Exception as exc:
         raise RuntimeError(
             "Could not connect to AirSim at "
@@ -327,6 +427,9 @@ async def run_runtime() -> int:
     mission_interval_s = float(runtime.get("mission_interval_s", 0.2))
     control_interval_s = float(runtime.get("control_interval_s", 0.2))
     run_duration_s = float(runtime.get("run_duration_s", 3.0))
+    dev_ui_enabled = bool(dev_ui_settings.get("enabled", True))
+    dev_ui_interval_s = float(dev_ui_settings.get("interval_s", 0.03))
+    dev_ui_window_name = str(dev_ui_settings.get("window_name", "drone_cv dev"))
 
     tasks = [
         asyncio.create_task(telemetry_loop(adapter, recorder, shared_state, state_lock, logger, telemetry_interval_s), name="telemetry"),
@@ -335,9 +438,25 @@ async def run_runtime() -> int:
         asyncio.create_task(mission_loop(visual_servo, obstacle_avoidance, recorder, settings, shared_state, state_lock, logger, mission_interval_s), name="mission"),
         asyncio.create_task(control_loop(adapter, shared_state, state_lock, logger, control_interval_s), name="control"),
     ]
+    if dev_ui_enabled:
+        tasks.append(
+            asyncio.create_task(
+                dev_ui_loop(
+                    shared_state,
+                    state_lock,
+                    logger,
+                    dev_ui_interval_s,
+                    dev_ui_window_name,
+                ),
+                name="dev_ui",
+            )
+        )
 
     try:
-        await asyncio.sleep(run_duration_s)
+        if dev_ui_enabled:
+            await next(task for task in tasks if task.get_name() == "dev_ui")
+        else:
+            await asyncio.sleep(run_duration_s)
     finally:
         for task in tasks:
             task.cancel()
@@ -345,6 +464,10 @@ async def run_runtime() -> int:
         await asyncio.to_thread(adapter.hover)
         await asyncio.to_thread(adapter.arm, False)
         await asyncio.to_thread(adapter.enable_api_control, False)
+        if dev_ui_enabled:
+            import cv2
+
+            cv2.destroyAllWindows()
     return 0
 
 
@@ -554,59 +677,62 @@ async def local_ui_loop(
             if key in {27, ord("q")}:
                 logger.info("Local UI loop requested shutdown")
                 return
-            if key in _LEFT_KEYS:
-                async with state_lock:
-                    shared_state.local_manual_yaw_rate_deg_s = -35.0
-                    shared_state.local_manual_vz_m_s = 0.0
-                    shared_state.local_manual_vy_m_s = 0.0
-                    shared_state.local_manual_override_until_s = time.monotonic() + 0.35
-                    shared_state.local_manual_status = "left"
-            elif key in _RIGHT_KEYS:
-                async with state_lock:
-                    shared_state.local_manual_yaw_rate_deg_s = 35.0
-                    shared_state.local_manual_vz_m_s = 0.0
-                    shared_state.local_manual_vy_m_s = 0.0
-                    shared_state.local_manual_override_until_s = time.monotonic() + 0.35
-                    shared_state.local_manual_status = "right"
-            elif key in _UP_KEYS:
-                async with state_lock:
-                    shared_state.local_manual_yaw_rate_deg_s = 0.0
-                    shared_state.local_manual_vz_m_s = -0.45
-                    shared_state.local_manual_vy_m_s = 0.0
-                    shared_state.local_manual_override_until_s = time.monotonic() + 0.35
-                    shared_state.local_manual_status = "up"
-            elif key in _DOWN_KEYS:
-                async with state_lock:
-                    shared_state.local_manual_yaw_rate_deg_s = 0.0
-                    shared_state.local_manual_vz_m_s = 0.45
-                    shared_state.local_manual_vy_m_s = 0.0
-                    shared_state.local_manual_override_until_s = time.monotonic() + 0.35
-                    shared_state.local_manual_status = "down"
-            elif key in _STRAFE_LEFT_KEYS:
-                async with state_lock:
-                    shared_state.local_manual_yaw_rate_deg_s = 0.0
-                    shared_state.local_manual_vz_m_s = 0.0
-                    shared_state.local_manual_vy_m_s = -0.45
-                    shared_state.local_manual_override_until_s = time.monotonic() + 0.35
-                    shared_state.local_manual_status = "strafe_left"
-            elif key in _STRAFE_RIGHT_KEYS:
-                async with state_lock:
-                    shared_state.local_manual_yaw_rate_deg_s = 0.0
-                    shared_state.local_manual_vz_m_s = 0.0
-                    shared_state.local_manual_vy_m_s = 0.45
-                    shared_state.local_manual_override_until_s = time.monotonic() + 0.35
-                    shared_state.local_manual_status = "strafe_right"
-            elif key in _STOP_KEYS:
-                async with state_lock:
-                    shared_state.local_spin_paused = not shared_state.local_spin_paused
-                    shared_state.local_manual_yaw_rate_deg_s = 0.0
-                    shared_state.local_manual_vz_m_s = 0.0
-                    shared_state.local_manual_vy_m_s = 0.0
-                    shared_state.local_manual_override_until_s = 0.0
-                    shared_state.local_manual_status = (
-                        "hold" if shared_state.local_spin_paused else "auto"
-                    )
+            if key != 255:
+                await _apply_manual_key_input(shared_state, state_lock, key)
         await asyncio.sleep(interval_s)
+
+
+async def _apply_manual_key_input(shared_state, state_lock: asyncio.Lock, key: int) -> None:
+    if key in _LEFT_KEYS:
+        async with state_lock:
+            shared_state.local_manual_yaw_rate_deg_s = -35.0
+            shared_state.local_manual_vz_m_s = 0.0
+            shared_state.local_manual_vy_m_s = 0.0
+            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_status = "left"
+    elif key in _RIGHT_KEYS:
+        async with state_lock:
+            shared_state.local_manual_yaw_rate_deg_s = 35.0
+            shared_state.local_manual_vz_m_s = 0.0
+            shared_state.local_manual_vy_m_s = 0.0
+            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_status = "right"
+    elif key in _UP_KEYS:
+        async with state_lock:
+            shared_state.local_manual_yaw_rate_deg_s = 0.0
+            shared_state.local_manual_vz_m_s = -0.45
+            shared_state.local_manual_vy_m_s = 0.0
+            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_status = "up"
+    elif key in _DOWN_KEYS:
+        async with state_lock:
+            shared_state.local_manual_yaw_rate_deg_s = 0.0
+            shared_state.local_manual_vz_m_s = 0.45
+            shared_state.local_manual_vy_m_s = 0.0
+            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_status = "down"
+    elif key in _STRAFE_LEFT_KEYS:
+        async with state_lock:
+            shared_state.local_manual_yaw_rate_deg_s = 0.0
+            shared_state.local_manual_vz_m_s = 0.0
+            shared_state.local_manual_vy_m_s = -0.45
+            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_status = "strafe_left"
+    elif key in _STRAFE_RIGHT_KEYS:
+        async with state_lock:
+            shared_state.local_manual_yaw_rate_deg_s = 0.0
+            shared_state.local_manual_vz_m_s = 0.0
+            shared_state.local_manual_vy_m_s = 0.45
+            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_status = "strafe_right"
+    elif key in _STOP_KEYS:
+        async with state_lock:
+            shared_state.local_spin_paused = not shared_state.local_spin_paused
+            shared_state.local_manual_yaw_rate_deg_s = 0.0
+            shared_state.local_manual_vz_m_s = 0.0
+            shared_state.local_manual_vy_m_s = 0.0
+            shared_state.local_manual_override_until_s = 0.0
+            shared_state.local_manual_status = "hold" if shared_state.local_spin_paused else "auto"
 
 
 async def run_local_runtime() -> int:
@@ -914,6 +1040,57 @@ def _draw_local_camera_overlay(
             cv2.LINE_AA,
         )
         y += 28
+
+
+def _draw_dev_camera_overlay(
+    frame_bgr,
+    mission_state: str,
+    mission_detail: str,
+    command_reason: str,
+    marker_detected: bool,
+    obstacle_detected: bool,
+    altitude_m: float,
+    steering_mode: str,
+) -> None:
+    import cv2
+
+    height, width = frame_bgr.shape[:2]
+    cv2.line(frame_bgr, (width // 2, 0), (width // 2, height), (40, 185, 255), 1, cv2.LINE_AA)
+    cv2.line(frame_bgr, (0, height // 2), (width, height // 2), (40, 185, 255), 1, cv2.LINE_AA)
+    cv2.circle(frame_bgr, (width // 2, height // 2), 12, (40, 185, 255), 1, cv2.LINE_AA)
+
+    lines = [
+        "AirSim DEV control",
+        f"mode={steering_mode} alt={altitude_m:.2f}m",
+        f"state={mission_state} marker={'yes' if marker_detected else 'no'} obstacle={'yes' if obstacle_detected else 'no'}",
+        f"mission={mission_detail}",
+        f"command={command_reason}",
+        "A/D: yaw | W/S: altitude | J/L: strafe",
+        "Space: pause auto yaw | Q/Esc: exit",
+    ]
+    y = 28
+    for line in lines:
+        cv2.putText(
+            frame_bgr,
+            line,
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (20, 20, 20),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame_bgr,
+            line,
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        y += 27
 
 
 def _build_local_ui_canvas(frame_bgr, world, altitude_m: float, mission_state: str, command, steering_mode: str) -> object:
