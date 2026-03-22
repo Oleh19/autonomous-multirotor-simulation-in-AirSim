@@ -13,6 +13,10 @@ jobs:
         with:
           python-version: "3.10"
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "numpy>=1.26,<3.0"
+          python -m pip install "opencv-contrib-python>=4.10,<5.0" "PyYAML>=6.0,<7.0" "pydantic>=2.8,<3.0" "pytest>=8.0,<9.0"
+          python -m pip install --no-build-isolation "airsim>=1.8.1"
       - name: Run stable test suite
         run: python -m pytest tests/test_settings_validation.py tests/test_command_safety.py tests/test_watchdog.py tests/test_freshness.py tests/test_logging.py tests/test_aruco_detector.py tests/test_depth_analyzer.py
