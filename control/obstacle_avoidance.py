@@ -9,10 +9,14 @@ import sys
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from adapters.airsim_client import AirSimClientAdapter, AirSimConnectionConfig
-from app.bootstrap import bootstrap_app
-from vision.depth_analyzer import DepthAnalysis, DepthAnalyzer
-from vision.frame_fetcher import FrameFetcher
+from app.bootstrap import (
+    bootstrap_app,
+    build_airsim_adapter,
+    build_depth_analyzer,
+    build_frame_fetcher,
+    build_obstacle_avoidance_controller,
+)
+from vision.depth_analyzer import DepthAnalysis
 
 
 @dataclass
@@ -72,40 +76,15 @@ def run_obstacle_avoidance_step() -> int:
     context = bootstrap_app()
     logger = context["logger"]
     settings = context["settings"]
-    airsim_settings = settings.get("airsim", {})
-    camera_settings = settings.get("camera", {})
-    depth_settings = settings.get("depth", {})
 
-    adapter = AirSimClientAdapter(
-        config=AirSimConnectionConfig(
-            host=str(airsim_settings.get("host", "127.0.0.1")),
-            port=int(airsim_settings.get("port", 41451)),
-            timeout_seconds=float(airsim_settings.get("timeout_seconds", 10.0)),
-            vehicle_name=str(airsim_settings.get("vehicle_name", "")),
-        ),
-        logger=logger,
-    )
+    adapter = build_airsim_adapter(settings, logger)
     adapter.connect()
     adapter.confirm_connection()
     adapter.enable_api_control(True)
 
-    frame_fetcher = FrameFetcher(
-        adapter=adapter,
-        rgb_camera_name=str(camera_settings.get("rgb_camera_name", "front_center")),
-        depth_camera_name=str(camera_settings.get("depth_camera_name", "front_center")),
-        logger=logger,
-    )
-    depth_analyzer = DepthAnalyzer(
-        obstacle_distance_m=float(depth_settings.get("obstacle_distance_m", 2.0)),
-        min_valid_depth_m=float(depth_settings.get("min_valid_depth_m", 0.2)),
-        max_valid_depth_m=float(depth_settings.get("max_valid_depth_m", 20.0)),
-    )
-    avoidance = ObstacleAvoidanceController(
-        avoidance_speed_m_s=float(depth_settings.get("avoidance_speed_m_s", 0.5)),
-        yaw_rate_deg_s=float(depth_settings.get("avoidance_yaw_rate_deg_s", 12.0)),
-        command_duration_s=float(depth_settings.get("avoidance_command_duration_s", 0.25)),
-        logger=logger,
-    )
+    frame_fetcher = build_frame_fetcher(settings, adapter, logger)
+    depth_analyzer = build_depth_analyzer(settings)
+    avoidance = build_obstacle_avoidance_controller(settings, logger)
 
     frame_bundle = frame_fetcher.fetch()
     analysis = depth_analyzer.analyze(frame_bundle.depth_m)

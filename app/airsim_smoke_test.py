@@ -8,8 +8,7 @@ import time
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from adapters.airsim_client import AirSimClientAdapter, AirSimConnectionConfig
-from app.bootstrap import bootstrap_app
+from app.bootstrap import bootstrap_app, build_airsim_adapter
 
 
 def main() -> int:
@@ -18,15 +17,7 @@ def main() -> int:
     settings = context["settings"]
     airsim_settings = settings.get("airsim", {})
 
-    adapter = AirSimClientAdapter(
-        config=AirSimConnectionConfig(
-            host=str(airsim_settings.get("host", "127.0.0.1")),
-            port=int(airsim_settings.get("port", 41451)),
-            timeout_seconds=float(airsim_settings.get("timeout_seconds", 10.0)),
-            vehicle_name=str(airsim_settings.get("vehicle_name", "")),
-        ),
-        logger=logger,
-    )
+    adapter = build_airsim_adapter(settings, logger)
 
     hover_duration_seconds = float(
         airsim_settings.get("smoke_test_hover_duration_seconds", 2.0)

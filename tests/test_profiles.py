@@ -1,5 +1,5 @@
 from app.bootstrap import load_settings
-from app.main import apply_runtime_profile
+from app.cli import apply_runtime_profile
 
 
 def test_safe_profile_tightens_runtime_guards() -> None:

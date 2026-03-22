@@ -79,8 +79,8 @@ control:
   max_velocity_z: 0.5
   yaw_rate_deg_s: 15.0
   servo_command_duration_s: 0.2
-  servo_max_lateral_velocity_m_s: 0.5
-  servo_max_vertical_velocity_m_s: 0.4
+  servo_max_lateral_velocity_m_s: 0.25
+  servo_max_vertical_velocity_m_s: 0.2
   servo_max_yaw_rate_deg_s: 10.0
   servo_yaw_error_deadband_px: 10.0
   servo_vertical_error_deadband_px: 12.0
@@ -95,7 +95,7 @@ control:
   servo_yaw_kd: 0.2
   approach_center_tolerance_px: 30.0
   approach_target_marker_area: 12000.0
-  approach_forward_speed_m_s: 0.4
+  approach_forward_speed_m_s: 0.2
   approach_command_duration_s: 0.25
 
 depth:

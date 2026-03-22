@@ -12,11 +12,9 @@ import numpy as np
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from adapters.airsim_client import AirSimClientAdapter, AirSimConnectionConfig
-from app.bootstrap import PROJECT_ROOT, bootstrap_app
+from app.bootstrap import PROJECT_ROOT, bootstrap_app, build_airsim_adapter, build_frame_fetcher
 from mission.states import MissionState
 from telemetry.models import TelemetrySnapshot
-from vision.frame_fetcher import FrameFetcher
 
 
 @dataclass
@@ -124,28 +122,13 @@ def run_overlay_debug() -> int:
     context = bootstrap_app()
     logger = context["logger"]
     settings = context["settings"]
-    airsim_settings = settings.get("airsim", {})
-    camera_settings = settings.get("camera", {})
     overlay_settings = settings.get("overlays", {})
 
-    adapter = AirSimClientAdapter(
-        config=AirSimConnectionConfig(
-            host=str(airsim_settings.get("host", "127.0.0.1")),
-            port=int(airsim_settings.get("port", 41451)),
-            timeout_seconds=float(airsim_settings.get("timeout_seconds", 10.0)),
-            vehicle_name=str(airsim_settings.get("vehicle_name", "")),
-        ),
-        logger=logger,
-    )
+    adapter = build_airsim_adapter(settings, logger)
     adapter.connect()
     adapter.confirm_connection()
 
-    frame_fetcher = FrameFetcher(
-        adapter=adapter,
-        rgb_camera_name=str(camera_settings.get("rgb_camera_name", "front_center")),
-        depth_camera_name=str(camera_settings.get("depth_camera_name", "front_center")),
-        logger=logger,
-    )
+    frame_fetcher = build_frame_fetcher(settings, adapter, logger)
     frame_bundle = frame_fetcher.fetch()
     telemetry = adapter.get_telemetry()
     mission_state = str(overlay_settings.get("mission_state", MissionState.IDLE.value))

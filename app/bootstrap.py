@@ -76,27 +76,11 @@ def validate_settings(settings: dict[str, Any]) -> list[str]:
     return []
 
 
-def build_runtime_components(settings: dict[str, Any], logger: logging.Logger) -> dict[str, Any]:
+def build_airsim_adapter(settings: dict[str, Any], logger: logging.Logger):
     from adapters.airsim_client import AirSimClientAdapter, AirSimConnectionConfig
-    from control.obstacle_avoidance import ObstacleAvoidanceController
-    from control.safety import CommandSafetyLimits, CommandSafetyLimiter
-    from control.visual_servo import VisualServoConfig, VisualServoController
-    from telemetry.recorder import TelemetryRecorder
-    from telemetry.models import RuntimeSharedState
-    from vision.aruco_detector import ArucoDetector
-    from vision.depth_analyzer import DepthAnalyzer
-    from vision.frame_fetcher import FrameFetcher
 
     airsim_settings = settings.get("airsim", {})
-    camera_settings = settings.get("camera", {})
-    aruco_settings = settings.get("aruco", {})
-    control_settings = settings.get("control", {})
-    depth_settings = settings.get("depth", {})
-    mission_settings = settings.get("mission", {})
-    recording_settings = settings.get("recording", {})
-    runtime = settings.get("runtime", {})
-
-    adapter = AirSimClientAdapter(
+    return AirSimClientAdapter(
         config=AirSimConnectionConfig(
             host=str(airsim_settings.get("host", "127.0.0.1")),
             port=int(airsim_settings.get("port", 41451)),
@@ -105,46 +89,73 @@ def build_runtime_components(settings: dict[str, Any], logger: logging.Logger) -
         ),
         logger=logger,
     )
-    frame_fetcher = FrameFetcher(
+
+
+def build_frame_fetcher(settings: dict[str, Any], adapter, logger: logging.Logger):
+    from vision.frame_fetcher import FrameFetcher
+
+    camera_settings = settings.get("camera", {})
+    return FrameFetcher(
         adapter=adapter,
         rgb_camera_name=str(camera_settings.get("rgb_camera_name", "front_center")),
         depth_camera_name=str(camera_settings.get("depth_camera_name", "front_center")),
         logger=logger,
     )
-    detector = ArucoDetector(
+
+
+def build_aruco_detector(settings: dict[str, Any]):
+    from vision.aruco_detector import ArucoDetector
+
+    aruco_settings = settings.get("aruco", {})
+    return ArucoDetector(
         dictionary_name=str(aruco_settings.get("dictionary", "DICT_4X4_50"))
     )
-    visual_servo = VisualServoController(
-        config=VisualServoConfig(
-            command_duration_s=float(control_settings.get("servo_command_duration_s", 0.2)),
-            max_lateral_velocity_m_s=float(control_settings.get("servo_max_lateral_velocity_m_s", 0.5)),
-            max_vertical_velocity_m_s=float(control_settings.get("servo_max_vertical_velocity_m_s", 0.4)),
-            max_yaw_rate_deg_s=float(control_settings.get("servo_max_yaw_rate_deg_s", 10.0)),
-            yaw_error_deadband_px=float(control_settings.get("servo_yaw_error_deadband_px", 10.0)),
-            vertical_error_deadband_px=float(control_settings.get("servo_vertical_error_deadband_px", 12.0)),
-            lateral_kp=float(control_settings.get("servo_lateral_kp", 0.4)),
-            lateral_ki=float(control_settings.get("servo_lateral_ki", 0.0)),
-            lateral_kd=float(control_settings.get("servo_lateral_kd", 0.05)),
-            vertical_kp=float(control_settings.get("servo_vertical_kp", 0.35)),
-            vertical_ki=float(control_settings.get("servo_vertical_ki", 0.0)),
-            vertical_kd=float(control_settings.get("servo_vertical_kd", 0.04)),
-            yaw_kp=float(control_settings.get("servo_yaw_kp", 5.0)),
-            yaw_ki=float(control_settings.get("servo_yaw_ki", 0.0)),
-            yaw_kd=float(control_settings.get("servo_yaw_kd", 0.2)),
-        ),
-        logger=logger,
-    )
-    depth_analyzer = DepthAnalyzer(
+
+
+def build_depth_analyzer(settings: dict[str, Any]):
+    from vision.depth_analyzer import DepthAnalyzer
+
+    depth_settings = settings.get("depth", {})
+    return DepthAnalyzer(
         obstacle_distance_m=float(depth_settings.get("obstacle_distance_m", 2.0)),
         min_valid_depth_m=float(depth_settings.get("min_valid_depth_m", 0.2)),
         max_valid_depth_m=float(depth_settings.get("max_valid_depth_m", 20.0)),
     )
-    obstacle_avoidance = ObstacleAvoidanceController(
+
+
+def build_obstacle_avoidance_controller(
+    settings: dict[str, Any],
+    logger: logging.Logger,
+):
+    from control.obstacle_avoidance import ObstacleAvoidanceController
+
+    depth_settings = settings.get("depth", {})
+    return ObstacleAvoidanceController(
         avoidance_speed_m_s=float(depth_settings.get("avoidance_speed_m_s", 0.5)),
         yaw_rate_deg_s=float(depth_settings.get("avoidance_yaw_rate_deg_s", 12.0)),
         command_duration_s=float(depth_settings.get("avoidance_command_duration_s", 0.25)),
         logger=logger,
     )
+
+
+def build_runtime_components(settings: dict[str, Any], logger: logging.Logger) -> dict[str, Any]:
+    from control.safety import CommandSafetyLimits, CommandSafetyLimiter
+    from control.visual_servo import build_visual_servo_controller
+    from telemetry.recorder import TelemetryRecorder
+    from telemetry.models import RuntimeSharedState
+
+    control_settings = settings.get("control", {})
+    depth_settings = settings.get("depth", {})
+    mission_settings = settings.get("mission", {})
+    recording_settings = settings.get("recording", {})
+    runtime = settings.get("runtime", {})
+
+    adapter = build_airsim_adapter(settings, logger)
+    frame_fetcher = build_frame_fetcher(settings, adapter, logger)
+    detector = build_aruco_detector(settings)
+    visual_servo = build_visual_servo_controller(control_settings, logger=logger)
+    depth_analyzer = build_depth_analyzer(settings)
+    obstacle_avoidance = build_obstacle_avoidance_controller(settings, logger)
     safety_limiter = CommandSafetyLimiter(
         CommandSafetyLimits(
             max_velocity_xy_m_s=float(control_settings.get("max_velocity_xy", 1.0)),

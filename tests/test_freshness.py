@@ -1,6 +1,6 @@
 from telemetry.models import RuntimeSharedState
 
-from app.main import _find_stale_sensor_names
+from app.runtime_loops import find_stale_sensor_names
 
 
 def test_freshness_detects_missing_or_old_sensor_updates() -> None:
@@ -12,7 +12,7 @@ def test_freshness_detects_missing_or_old_sensor_updates() -> None:
     shared_state.detection = object()
     shared_state.detection_updated_at_s = 10.1
 
-    stale_sensor_names = _find_stale_sensor_names(
+    stale_sensor_names = find_stale_sensor_names(
         shared_state=shared_state,
         now_s=10.5,
         freshness_settings={
@@ -37,7 +37,7 @@ def test_freshness_accepts_recent_sensor_updates() -> None:
     shared_state.depth_analysis = object()
     shared_state.depth_analysis_updated_at_s = 20.2
 
-    stale_sensor_names = _find_stale_sensor_names(
+    stale_sensor_names = find_stale_sensor_names(
         shared_state=shared_state,
         now_s=20.7,
         freshness_settings={
