@@ -4,6 +4,7 @@ import asyncio
 import argparse
 import copy
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -20,9 +21,203 @@ _LEFT_KEYS = {ord("a"), ord("A")}
 _RIGHT_KEYS = {ord("d"), ord("D")}
 _UP_KEYS = {ord("w"), ord("W")}
 _DOWN_KEYS = {ord("s"), ord("S")}
+_FORWARD_KEYS = {ord("i"), ord("I")}
+_BACKWARD_KEYS = {ord("k"), ord("K")}
 _STRAFE_LEFT_KEYS = {ord("j"), ord("J")}
 _STRAFE_RIGHT_KEYS = {ord("l"), ord("L")}
 _STOP_KEYS = {32}
+_MANUAL_MODE_TOGGLE_KEYS = {ord("m"), ord("M")}
+_WATCHDOG_LOOP_NAMES = ("telemetry", "frame", "vision", "mission", "control")
+_MANUAL_OVERRIDE_DURATION_S = 0.8
+_MANUAL_XY_SPEED_M_S = 1.0
+_MANUAL_Z_SPEED_M_S = 0.5
+_MANUAL_YAW_RATE_DEG_S = 25.0
+
+
+class _TerminalKeyReader:
+    def __init__(self) -> None:
+        self._isatty = sys.stdin.isatty()
+        self._fd: int | None = None
+        self._termios_module = None
+        self._saved_termios = None
+
+    def __enter__(self) -> "_TerminalKeyReader":
+        if not self._isatty or os.name == "nt" or _running_in_wsl():
+            return self
+
+        import termios
+        import tty
+
+        self._fd = sys.stdin.fileno()
+        self._termios_module = termios
+        self._saved_termios = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb) -> None:
+        if self._fd is not None and self._saved_termios is not None and self._termios_module is not None:
+            self._termios_module.tcsetattr(
+                self._fd,
+                self._termios_module.TCSADRAIN,
+                self._saved_termios,
+            )
+
+    def read_key(self, timeout_s: float) -> str | None:
+        if not self._isatty:
+            time.sleep(timeout_s)
+            return None
+
+        if os.name == "nt":
+            import msvcrt
+
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if msvcrt.kbhit():
+                    key = msvcrt.getwch()
+                    if key in {"\x00", "\xe0"} and msvcrt.kbhit():
+                        msvcrt.getwch()
+                        return None
+                    return key
+                time.sleep(0.01)
+            return None
+
+        import select
+
+        if _running_in_wsl():
+            readable, _, _ = select.select([sys.stdin], [], [], timeout_s)
+            if readable:
+                line = sys.stdin.readline().strip()
+                if line:
+                    return line[0]
+            return None
+
+        readable, _, _ = select.select([sys.stdin], [], [], timeout_s)
+        if readable:
+            return sys.stdin.read(1)
+        return None
+
+
+def _terminal_controls_available() -> bool:
+    return sys.stdin.isatty()
+
+
+def _running_in_wsl() -> bool:
+    return bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"))
+
+
+def _build_manual_override_command(
+    manual_status: str,
+    manual_vx_m_s: float,
+    manual_vy_m_s: float,
+    manual_vz_m_s: float,
+    manual_yaw_rate_deg_s: float,
+    duration_s: float,
+):
+    from telemetry.models import RuntimeControlCommand
+
+    vx = 0.0
+    vy = 0.0
+    vz = 0.0
+    yaw_rate = 0.0
+
+    if manual_status in {"forward", "backward"}:
+        vx = manual_vx_m_s
+    elif manual_status in {"strafe_left", "strafe_right"}:
+        vy = manual_vy_m_s
+    elif manual_status in {"up", "down"}:
+        vz = manual_vz_m_s
+    elif manual_status in {"left", "right"}:
+        yaw_rate = manual_yaw_rate_deg_s
+
+    return RuntimeControlCommand(
+        vx=vx,
+        vy=vy,
+        vz=vz,
+        yaw_rate=yaw_rate,
+        duration_s=duration_s,
+        source="manual",
+        reason=f"manual {manual_status}",
+    )
+
+
+async def _mark_loop_heartbeat(shared_state, state_lock: asyncio.Lock, loop_name: str) -> None:
+    async with state_lock:
+        shared_state.loop_heartbeats[loop_name] = time.monotonic()
+
+
+def _find_stale_loop_names(
+    heartbeats: dict[str, float],
+    tracked_loop_names: tuple[str, ...],
+    now_s: float,
+    stale_after_s: float,
+) -> list[str]:
+    stale_loop_names: list[str] = []
+    for loop_name in tracked_loop_names:
+        last_heartbeat_s = heartbeats.get(loop_name)
+        if last_heartbeat_s is None or (now_s - last_heartbeat_s) > stale_after_s:
+            stale_loop_names.append(loop_name)
+    return stale_loop_names
+
+
+def _find_stale_sensor_names(
+    shared_state,
+    now_s: float,
+    freshness_settings: dict[str, float],
+) -> list[str]:
+    sensor_checks = (
+        ("telemetry", shared_state.telemetry, shared_state.telemetry_updated_at_s, float(freshness_settings.get("telemetry_max_age_s", 1.5))),
+        ("frames", shared_state.frames, shared_state.frames_updated_at_s, float(freshness_settings.get("frames_max_age_s", 1.0))),
+        ("detection", shared_state.detection, shared_state.detection_updated_at_s, float(freshness_settings.get("detection_max_age_s", 1.0))),
+        ("depth_analysis", shared_state.depth_analysis, shared_state.depth_analysis_updated_at_s, float(freshness_settings.get("depth_analysis_max_age_s", 1.0))),
+    )
+    stale_sensor_names: list[str] = []
+    for sensor_name, sensor_value, updated_at_s, max_age_s in sensor_checks:
+        if sensor_value is None or updated_at_s <= 0.0 or (now_s - updated_at_s) > max_age_s:
+            stale_sensor_names.append(sensor_name)
+    return stale_sensor_names
+
+
+async def watchdog_loop(
+    shared_state,
+    state_lock: asyncio.Lock,
+    logger,
+    interval_s: float,
+    stale_after_s: float,
+) -> None:
+    from mission.states import MissionState
+    from telemetry.models import RuntimeControlCommand
+
+    while True:
+        now_s = time.monotonic()
+        should_trip = False
+        reason = ""
+        async with state_lock:
+            if not shared_state.watchdog_triggered:
+                stale_loop_names = _find_stale_loop_names(
+                    shared_state.loop_heartbeats,
+                    _WATCHDOG_LOOP_NAMES,
+                    now_s,
+                    stale_after_s,
+                )
+                if stale_loop_names:
+                    should_trip = True
+                    reason = (
+                        "watchdog detected stale loop heartbeat: "
+                        + ", ".join(sorted(stale_loop_names))
+                    )
+                    shared_state.watchdog_triggered = True
+                    shared_state.watchdog_reason = reason
+                    shared_state.mission_state = MissionState.FAILSAFE
+                    shared_state.mission_detail = reason
+                    shared_state.desired_command = RuntimeControlCommand(
+                        duration_s=interval_s,
+                        source="watchdog",
+                        reason=reason,
+                    )
+                    shared_state.control_applied = False
+        if should_trip:
+            logger.error("Watchdog trip | %s", reason)
+        await asyncio.sleep(interval_s)
 
 
 async def telemetry_loop(
@@ -36,10 +231,12 @@ async def telemetry_loop(
     from telemetry.logger import format_snapshot
 
     while True:
+        await _mark_loop_heartbeat(shared_state, state_lock, "telemetry")
         snapshot = await asyncio.to_thread(adapter.get_telemetry)
         await asyncio.to_thread(recorder.record_telemetry, snapshot)
         async with state_lock:
             shared_state.telemetry = snapshot
+            shared_state.telemetry_updated_at_s = time.monotonic()
         logger.info("Telemetry loop | %s", format_snapshot(snapshot))
         await asyncio.sleep(interval_s)
 
@@ -54,6 +251,7 @@ async def frame_loop(
     from telemetry.models import RuntimeFrameState
 
     while True:
+        await _mark_loop_heartbeat(shared_state, state_lock, "frame")
         frame_bundle = await asyncio.to_thread(frame_fetcher.fetch)
         async with state_lock:
             shared_state.frames = RuntimeFrameState(
@@ -62,6 +260,7 @@ async def frame_loop(
                 rgb_timestamp=frame_bundle.rgb_timestamp,
                 depth_timestamp=frame_bundle.depth_timestamp,
             )
+            shared_state.frames_updated_at_s = time.monotonic()
         logger.info(
             "Frame loop | rgb_ts=%s depth_ts=%s",
             frame_bundle.rgb_timestamp,
@@ -81,6 +280,7 @@ async def vision_loop(
     interval_s: float,
 ) -> None:
     while True:
+        await _mark_loop_heartbeat(shared_state, state_lock, "vision")
         async with state_lock:
             frames = shared_state.frames
         if frames is not None and frames.rgb_frame is not None and frames.depth_frame is not None:
@@ -92,7 +292,9 @@ async def vision_loop(
             depth_analysis = await asyncio.to_thread(depth_analyzer.analyze, frames.depth_frame)
             async with state_lock:
                 shared_state.detection = detection
+                shared_state.detection_updated_at_s = time.monotonic()
                 shared_state.depth_analysis = depth_analysis
+                shared_state.depth_analysis_updated_at_s = time.monotonic()
             await asyncio.to_thread(
                 recorder.maybe_save_debug_frame,
                 frames.rgb_frame,
@@ -124,26 +326,63 @@ async def mission_loop(
     control_settings = settings.get("control", {})
     depth_settings = settings.get("depth", {})
     aruco_settings = settings.get("aruco", {})
+    freshness_settings = settings.get("freshness", {})
+    mission_settings = settings.get("mission", {})
     target_marker_area = float(control_settings.get("approach_target_marker_area", 12000.0))
     center_tolerance_px = float(control_settings.get("approach_center_tolerance_px", 30.0))
     command_duration_s = float(control_settings.get("approach_command_duration_s", 0.25))
     forward_speed_m_s = float(control_settings.get("approach_forward_speed_m_s", 0.4))
     target_marker_id = int(aruco_settings.get("marker_id", 0))
+    auto_descend_on_target = bool(mission_settings.get("auto_descend_on_target", False))
+    auto_land_on_target = bool(mission_settings.get("auto_land_on_target", False))
     last_event_key: tuple[str, str] | None = None
 
     while True:
+        await _mark_loop_heartbeat(shared_state, state_lock, "mission")
         async with state_lock:
             detection = shared_state.detection
             depth_analysis = shared_state.depth_analysis
             frames = shared_state.frames
             telemetry = shared_state.telemetry
             current_state = shared_state.mission_state
+            watchdog_triggered = shared_state.watchdog_triggered
+            watchdog_reason = shared_state.watchdog_reason
+            manual_mode_enabled = shared_state.local_manual_mode_enabled
+            stale_sensor_names = _find_stale_sensor_names(
+                shared_state,
+                time.monotonic(),
+                freshness_settings,
+            )
 
         mission_state = current_state
         mission_detail = "waiting for sensor data"
         desired_command = RuntimeControlCommand(duration_s=command_duration_s)
 
-        if telemetry is None or frames is None or detection is None or depth_analysis is None:
+        if watchdog_triggered:
+            mission_state = MissionState.FAILSAFE
+            mission_detail = watchdog_reason or "watchdog tripped"
+            desired_command = RuntimeControlCommand(
+                duration_s=command_duration_s,
+                source="watchdog",
+                reason=mission_detail,
+            )
+        elif manual_mode_enabled:
+            mission_state = MissionState.IDLE
+            mission_detail = "manual mode enabled"
+            desired_command = RuntimeControlCommand(
+                duration_s=command_duration_s,
+                source="manual_mode",
+                reason=mission_detail,
+            )
+        elif stale_sensor_names:
+            mission_state = MissionState.FAILSAFE
+            mission_detail = "stale sensor data: " + ", ".join(stale_sensor_names)
+            desired_command = RuntimeControlCommand(
+                duration_s=command_duration_s,
+                source="freshness_guard",
+                reason=mission_detail,
+            )
+        elif telemetry is None or frames is None or detection is None or depth_analysis is None:
             mission_state = MissionState.IDLE
         elif not detection.detected or detection.marker_id != target_marker_id:
             mission_state = MissionState.SEARCH
@@ -164,7 +403,7 @@ async def mission_loop(
                 abs(servo_command.error_x_px) <= center_tolerance_px
                 and abs(servo_command.error_y_px) <= center_tolerance_px
             )
-            if detection.area >= float(settings.get("mission", {}).get("descend_marker_area_threshold", 18000.0)):
+            if auto_descend_on_target and detection.area >= float(settings.get("mission", {}).get("descend_marker_area_threshold", 18000.0)):
                 mission_state = MissionState.DESCEND
                 desired_command = RuntimeControlCommand(
                     vx=0.0,
@@ -213,7 +452,7 @@ async def mission_loop(
                     reason="marker centered and small; approach",
                 )
                 mission_detail = desired_command.reason
-            elif telemetry.altitude_m <= float(settings.get("landing", {}).get("touchdown_altitude_m", 0.15)):
+            elif auto_land_on_target and telemetry.altitude_m <= float(settings.get("landing", {}).get("touchdown_altitude_m", 0.15)):
                 mission_state = MissionState.LAND
                 desired_command = RuntimeControlCommand(
                     source="mission_loop",
@@ -229,7 +468,15 @@ async def mission_loop(
                     yaw_rate=servo_command.yaw_rate,
                     duration_s=command_duration_s,
                     source="mission_loop",
-                    reason="marker stable; hold alignment",
+                    reason=(
+                        "marker stable near target; hold without auto descend"
+                        if not auto_descend_on_target
+                        else (
+                            "marker stable near target; hold without autoland"
+                            if not auto_land_on_target
+                            else "marker stable; hold alignment"
+                        )
+                    ),
                 )
                 mission_detail = desired_command.reason
 
@@ -253,6 +500,7 @@ async def mission_loop(
 
 async def control_loop(
     adapter,
+    safety_limiter,
     shared_state,
     state_lock: asyncio.Lock,
     logger,
@@ -262,31 +510,41 @@ async def control_loop(
     from telemetry.models import RuntimeControlCommand
 
     while True:
+        await _mark_loop_heartbeat(shared_state, state_lock, "control")
         async with state_lock:
             command = shared_state.desired_command
             mission_state = shared_state.mission_state
             already_applied = shared_state.control_applied
+            manual_vx_m_s = shared_state.local_manual_vx_m_s
             manual_yaw_rate_deg_s = shared_state.local_manual_yaw_rate_deg_s
             manual_vz_m_s = shared_state.local_manual_vz_m_s
             manual_vy_m_s = shared_state.local_manual_vy_m_s
             manual_override_until_s = shared_state.local_manual_override_until_s
             manual_status = shared_state.local_manual_status
             spin_paused = shared_state.local_spin_paused
+            manual_mode_enabled = shared_state.local_manual_mode_enabled
+            watchdog_triggered = shared_state.watchdog_triggered
+            watchdog_reason = shared_state.watchdog_reason
 
         if not already_applied:
             manual_active = time.monotonic() < manual_override_until_s
             effective_command = command
 
-            if manual_active:
-                manual_vx = 0.0 if manual_status in {"strafe_left", "strafe_right"} else command.vx
+            if watchdog_triggered:
+                manual_active = False
                 effective_command = RuntimeControlCommand(
-                    vx=manual_vx,
-                    vy=manual_vy_m_s if manual_status in {"strafe_left", "strafe_right"} else command.vy,
-                    vz=manual_vz_m_s if manual_status in {"up", "down", "hold"} else command.vz,
-                    yaw_rate=manual_yaw_rate_deg_s,
                     duration_s=max(command.duration_s, interval_s),
-                    source=command.source,
-                    reason=f"{command.reason} | manual yaw {manual_status}",
+                    source="watchdog",
+                    reason=watchdog_reason or "watchdog tripped",
+                )
+            elif manual_active:
+                effective_command = _build_manual_override_command(
+                    manual_status=manual_status,
+                    manual_vx_m_s=manual_vx_m_s,
+                    manual_vy_m_s=manual_vy_m_s,
+                    manual_vz_m_s=manual_vz_m_s,
+                    manual_yaw_rate_deg_s=manual_yaw_rate_deg_s,
+                    duration_s=max(command.duration_s, interval_s),
                 )
             elif spin_paused:
                 effective_command = RuntimeControlCommand(
@@ -298,10 +556,11 @@ async def control_loop(
                     source=command.source,
                     reason=f"{command.reason} | auto spin paused",
                 )
+            effective_command = safety_limiter.clamp(effective_command)
 
             if mission_state == MissionState.LAND and not manual_active:
                 await asyncio.to_thread(adapter.land)
-            elif mission_state == MissionState.IDLE and not manual_active:
+            elif mission_state in {MissionState.IDLE, MissionState.FAILSAFE} and not manual_active:
                 await asyncio.to_thread(adapter.hover)
             else:
                 await asyncio.to_thread(
@@ -315,9 +574,10 @@ async def control_loop(
             async with state_lock:
                 shared_state.control_applied = True
             logger.info(
-                "Control loop | state=%s manual=%s vx=%.3f vy=%.3f vz=%.3f yaw_rate=%.3f command=%s",
+                "Control loop | state=%s manual=%s manual_mode=%s vx=%.3f vy=%.3f vz=%.3f yaw_rate=%.3f command=%s",
                 mission_state.value,
                 manual_active,
+                manual_mode_enabled,
                 effective_command.vx,
                 effective_command.vy,
                 effective_command.vz,
@@ -348,6 +608,7 @@ async def dev_ui_loop(
             telemetry = shared_state.telemetry
             manual_override_until_s = shared_state.local_manual_override_until_s
             spin_paused = shared_state.local_spin_paused
+            manual_mode_enabled = shared_state.local_manual_mode_enabled
 
         frame = None
         if frames is not None and frames.rgb_frame is not None:
@@ -364,9 +625,13 @@ async def dev_ui_loop(
             obstacle_detected=depth_analysis.obstacle_detected if depth_analysis is not None else False,
             altitude_m=telemetry.altitude_m if telemetry is not None else 0.0,
             steering_mode=(
-                "manual"
+                "manual-only"
+                if manual_mode_enabled
+                else (
+                    "manual"
                 if time.monotonic() < manual_override_until_s
                 else ("paused" if spin_paused else "auto")
+                )
             ),
         )
         cv2.imshow(window_name, frame)
@@ -380,12 +645,49 @@ async def dev_ui_loop(
         await asyncio.sleep(interval_s)
 
 
-async def run_runtime() -> int:
-    context = bootstrap_app()
-    settings = context["settings"]
-    logger = context["logger"]
+async def terminal_control_loop(
+    shared_state,
+    state_lock: asyncio.Lock,
+    logger,
+    interval_s: float,
+    mode_name: str,
+) -> None:
+    if not _terminal_controls_available():
+        logger.info("Terminal control unavailable because stdin is not a TTY")
+        return
+
+    controls_hint = (
+        f"{mode_name} terminal controls: A/D yaw | W/S altitude | I/K forward/back | "
+        "J/L strafe | Space pause auto yaw | Q quit"
+    )
+    if _running_in_wsl():
+        controls_hint += " | in WSL terminals, type the key and press Enter"
+    print(controls_hint)
+    with _TerminalKeyReader() as key_reader:
+        while True:
+            key_text = await asyncio.to_thread(key_reader.read_key, interval_s)
+            if key_text is None:
+                await asyncio.sleep(interval_s)
+                continue
+
+            if key_text in {"q", "Q", "\x1b"}:
+                async with state_lock:
+                    shared_state.shutdown_requested = True
+                logger.info("Terminal control requested shutdown")
+                return
+
+            if key_text in {" ", "a", "A", "d", "D", "w", "W", "s", "S", "i", "I", "k", "K", "j", "J", "l", "L", "m", "M"}:
+                await _apply_manual_key_input(shared_state, state_lock, ord(key_text))
+
+
+async def run_runtime(settings: dict[str, object] | None = None, logger=None) -> int:
+    if settings is None or logger is None:
+        context = bootstrap_app()
+        settings = context["settings"]
+        logger = context["logger"]
     app_name = settings["app"]["name"]
     runtime = settings.get("runtime", {})
+    watchdog_settings = settings.get("watchdog", {})
     airsim_settings = settings.get("airsim", {})
     dev_ui_settings = settings.get("dev_ui", {})
 
@@ -399,9 +701,12 @@ async def run_runtime() -> int:
     visual_servo = components["visual_servo"]
     depth_analyzer = components["depth_analyzer"]
     obstacle_avoidance = components["obstacle_avoidance"]
+    safety_limiter = components["safety_limiter"]
     recorder = components["recorder"]
     shared_state = components["shared_state"]
     state_lock = components["state_lock"]
+    now_s = time.monotonic()
+    shared_state.loop_heartbeats = {loop_name: now_s for loop_name in _WATCHDOG_LOOP_NAMES}
 
     try:
         await asyncio.to_thread(adapter.connect)
@@ -427,6 +732,9 @@ async def run_runtime() -> int:
     mission_interval_s = float(runtime.get("mission_interval_s", 0.2))
     control_interval_s = float(runtime.get("control_interval_s", 0.2))
     run_duration_s = float(runtime.get("run_duration_s", 3.0))
+    watchdog_enabled = bool(watchdog_settings.get("enabled", True))
+    watchdog_interval_s = float(watchdog_settings.get("loop_interval_s", 0.1))
+    watchdog_stale_after_s = float(watchdog_settings.get("stale_after_s", 1.0))
     dev_ui_enabled = bool(dev_ui_settings.get("enabled", True))
     dev_ui_interval_s = float(dev_ui_settings.get("interval_s", 0.03))
     dev_ui_window_name = str(dev_ui_settings.get("window_name", "drone_cv dev"))
@@ -436,25 +744,49 @@ async def run_runtime() -> int:
         asyncio.create_task(frame_loop(frame_fetcher, shared_state, state_lock, logger, frame_interval_s), name="frame"),
         asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, shared_state, state_lock, logger, vision_interval_s), name="vision"),
         asyncio.create_task(mission_loop(visual_servo, obstacle_avoidance, recorder, settings, shared_state, state_lock, logger, mission_interval_s), name="mission"),
-        asyncio.create_task(control_loop(adapter, shared_state, state_lock, logger, control_interval_s), name="control"),
+        asyncio.create_task(control_loop(adapter, safety_limiter, shared_state, state_lock, logger, control_interval_s), name="control"),
     ]
-    if dev_ui_enabled:
+    interaction_tasks = []
+    if watchdog_enabled:
         tasks.append(
             asyncio.create_task(
-                dev_ui_loop(
-                    shared_state,
-                    state_lock,
-                    logger,
-                    dev_ui_interval_s,
-                    dev_ui_window_name,
-                ),
-                name="dev_ui",
+                watchdog_loop(shared_state, state_lock, logger, watchdog_interval_s, watchdog_stale_after_s),
+                name="watchdog",
             )
         )
+    if dev_ui_enabled:
+        dev_ui_task = asyncio.create_task(
+            dev_ui_loop(
+                shared_state,
+                state_lock,
+                logger,
+                dev_ui_interval_s,
+                dev_ui_window_name,
+            ),
+            name="dev_ui",
+        )
+        tasks.append(dev_ui_task)
+        interaction_tasks.append(dev_ui_task)
+    if _terminal_controls_available():
+        terminal_task = asyncio.create_task(
+            terminal_control_loop(
+                shared_state,
+                state_lock,
+                logger,
+                0.05,
+                "dev",
+            ),
+            name="terminal_control",
+        )
+        tasks.append(terminal_task)
+        interaction_tasks.append(terminal_task)
 
     try:
-        if dev_ui_enabled:
-            await next(task for task in tasks if task.get_name() == "dev_ui")
+        if interaction_tasks:
+            done, pending = await asyncio.wait(interaction_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*done, return_exceptions=True)
         else:
             await asyncio.sleep(run_duration_s)
     finally:
@@ -482,6 +814,7 @@ async def local_telemetry_loop(
     from telemetry.models import Quaternion, TelemetrySnapshot, Vector3
 
     while True:
+        await _mark_loop_heartbeat(shared_state, state_lock, "telemetry")
         async with state_lock:
             world = shared_state.local_world
         if world is None:
@@ -513,6 +846,7 @@ async def local_telemetry_loop(
         await asyncio.to_thread(recorder.record_telemetry, snapshot)
         async with state_lock:
             shared_state.telemetry = snapshot
+            shared_state.telemetry_updated_at_s = time.monotonic()
         logger.info("Local telemetry | %s", format_snapshot(snapshot))
         await asyncio.sleep(interval_s)
 
@@ -528,6 +862,7 @@ async def local_frame_loop(
     from telemetry.models import RuntimeFrameState
 
     while True:
+        await _mark_loop_heartbeat(shared_state, state_lock, "frame")
         async with state_lock:
             world = shared_state.local_world
         if world is None:
@@ -552,6 +887,7 @@ async def local_frame_loop(
                 depth_timestamp=timestamp,
                 local_world_snapshot=frame_world_snapshot,
             )
+            shared_state.frames_updated_at_s = time.monotonic()
             shared_state.local_world.marker_visible = marker_visible
             shared_state.local_world.marker_distance_m = marker_distance_m
             shared_state.local_world.obstacle_distance_m = obstacle_distance_m
@@ -567,37 +903,55 @@ async def local_frame_loop(
 
 
 async def local_control_loop(
+    safety_limiter,
     shared_state,
     state_lock: asyncio.Lock,
     logger,
     interval_s: float,
 ) -> None:
     while True:
+        await _mark_loop_heartbeat(shared_state, state_lock, "control")
         async with state_lock:
             command = shared_state.desired_command
             mission_state = shared_state.mission_state
             already_applied = shared_state.control_applied
             world = shared_state.local_world
+            manual_vx_m_s = shared_state.local_manual_vx_m_s
             manual_yaw_rate_deg_s = shared_state.local_manual_yaw_rate_deg_s
             manual_vz_m_s = shared_state.local_manual_vz_m_s
             manual_vy_m_s = shared_state.local_manual_vy_m_s
             manual_override_until_s = shared_state.local_manual_override_until_s
             manual_status = shared_state.local_manual_status
             spin_paused = shared_state.local_spin_paused
+            manual_mode_enabled = shared_state.local_manual_mode_enabled
+            watchdog_triggered = shared_state.watchdog_triggered
+            watchdog_reason = shared_state.watchdog_reason
         if not already_applied:
             effective_command = command
-            if time.monotonic() < manual_override_until_s:
+            if watchdog_triggered:
                 from telemetry.models import RuntimeControlCommand
 
-                manual_vx = 0.0 if manual_status in {"strafe_left", "strafe_right"} else command.vx
                 effective_command = RuntimeControlCommand(
-                    vx=manual_vx,
-                    vy=manual_vy_m_s if manual_status in {"strafe_left", "strafe_right"} else command.vy,
-                    vz=manual_vz_m_s if manual_status in {"up", "down", "hold"} else command.vz,
-                    yaw_rate=manual_yaw_rate_deg_s,
-                    duration_s=command.duration_s,
-                    source=command.source,
-                    reason=f"{command.reason} | manual yaw {manual_status}",
+                    duration_s=max(command.duration_s, interval_s),
+                    source="watchdog",
+                    reason=watchdog_reason or "watchdog tripped",
+                )
+            elif mission_state.value == "failsafe":
+                from telemetry.models import RuntimeControlCommand
+
+                effective_command = RuntimeControlCommand(
+                    duration_s=max(command.duration_s, interval_s),
+                    source="failsafe",
+                    reason=command.reason,
+                )
+            elif time.monotonic() < manual_override_until_s:
+                effective_command = _build_manual_override_command(
+                    manual_status=manual_status,
+                    manual_vx_m_s=manual_vx_m_s,
+                    manual_vy_m_s=manual_vy_m_s,
+                    manual_vz_m_s=manual_vz_m_s,
+                    manual_yaw_rate_deg_s=manual_yaw_rate_deg_s,
+                    duration_s=max(command.duration_s, interval_s),
                 )
             elif spin_paused:
                 from telemetry.models import RuntimeControlCommand
@@ -611,11 +965,13 @@ async def local_control_loop(
                     source=command.source,
                     reason=f"{command.reason} | auto spin paused",
                 )
+            effective_command = safety_limiter.clamp(effective_command)
             if world is not None:
                 _apply_local_command(world, effective_command, max(effective_command.duration_s, interval_s))
             logger.info(
-                "Local control | state=%s x=%.2f y=%.2f alt=%.2f yaw=%.1f vx=%.3f vy=%.3f vz=%.3f yaw_rate=%.3f reason=%s",
+                "Local control | state=%s manual_mode=%s x=%.2f y=%.2f alt=%.2f yaw=%.1f vx=%.3f vy=%.3f vz=%.3f yaw_rate=%.3f reason=%s",
                 mission_state.value,
+                manual_mode_enabled,
                 world.drone_x_m if world is not None else 0.0,
                 world.drone_y_m if world is not None else 0.0,
                 world.altitude_m if world is not None else 0.0,
@@ -652,6 +1008,7 @@ async def local_ui_loop(
             world = shared_state.local_world
             manual_override_until_s = shared_state.local_manual_override_until_s
             spin_paused = shared_state.local_spin_paused
+            manual_mode_enabled = shared_state.local_manual_mode_enabled
 
         if frames is not None and frames.rgb_frame is not None and world is not None:
             view_world = frames.local_world_snapshot if frames.local_world_snapshot is not None else world
@@ -670,7 +1027,11 @@ async def local_ui_loop(
                 view_world.altitude_m,
                 mission_state.value,
                 command,
-                "manual" if time.monotonic() < manual_override_until_s else ("paused" if spin_paused else "auto"),
+                (
+                    "manual-only"
+                    if manual_mode_enabled
+                    else ("manual" if time.monotonic() < manual_override_until_s else ("paused" if spin_paused else "auto"))
+                ),
             )
             cv2.imshow(window_name, canvas)
             key = cv2.waitKey(1) & 0xFF
@@ -685,49 +1046,83 @@ async def local_ui_loop(
 async def _apply_manual_key_input(shared_state, state_lock: asyncio.Lock, key: int) -> None:
     if key in _LEFT_KEYS:
         async with state_lock:
-            shared_state.local_manual_yaw_rate_deg_s = -35.0
+            shared_state.local_manual_vx_m_s = 0.0
+            shared_state.local_manual_yaw_rate_deg_s = -_MANUAL_YAW_RATE_DEG_S
             shared_state.local_manual_vz_m_s = 0.0
             shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_override_until_s = time.monotonic() + _MANUAL_OVERRIDE_DURATION_S
             shared_state.local_manual_status = "left"
     elif key in _RIGHT_KEYS:
         async with state_lock:
-            shared_state.local_manual_yaw_rate_deg_s = 35.0
+            shared_state.local_manual_vx_m_s = 0.0
+            shared_state.local_manual_yaw_rate_deg_s = _MANUAL_YAW_RATE_DEG_S
             shared_state.local_manual_vz_m_s = 0.0
             shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_override_until_s = time.monotonic() + _MANUAL_OVERRIDE_DURATION_S
             shared_state.local_manual_status = "right"
     elif key in _UP_KEYS:
         async with state_lock:
+            shared_state.local_manual_vx_m_s = 0.0
             shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = -0.45
+            shared_state.local_manual_vz_m_s = -_MANUAL_Z_SPEED_M_S
             shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_override_until_s = time.monotonic() + _MANUAL_OVERRIDE_DURATION_S
             shared_state.local_manual_status = "up"
     elif key in _DOWN_KEYS:
         async with state_lock:
+            shared_state.local_manual_vx_m_s = 0.0
             shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = 0.45
+            shared_state.local_manual_vz_m_s = _MANUAL_Z_SPEED_M_S
             shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_override_until_s = time.monotonic() + _MANUAL_OVERRIDE_DURATION_S
             shared_state.local_manual_status = "down"
-    elif key in _STRAFE_LEFT_KEYS:
+    elif key in _FORWARD_KEYS:
         async with state_lock:
+            shared_state.local_manual_vx_m_s = _MANUAL_XY_SPEED_M_S
             shared_state.local_manual_yaw_rate_deg_s = 0.0
             shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = -0.45
-            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_vy_m_s = 0.0
+            shared_state.local_manual_override_until_s = time.monotonic() + _MANUAL_OVERRIDE_DURATION_S
+            shared_state.local_manual_status = "forward"
+    elif key in _BACKWARD_KEYS:
+        async with state_lock:
+            shared_state.local_manual_vx_m_s = -_MANUAL_XY_SPEED_M_S
+            shared_state.local_manual_yaw_rate_deg_s = 0.0
+            shared_state.local_manual_vz_m_s = 0.0
+            shared_state.local_manual_vy_m_s = 0.0
+            shared_state.local_manual_override_until_s = time.monotonic() + _MANUAL_OVERRIDE_DURATION_S
+            shared_state.local_manual_status = "backward"
+    elif key in _STRAFE_LEFT_KEYS:
+        async with state_lock:
+            shared_state.local_manual_vx_m_s = 0.0
+            shared_state.local_manual_yaw_rate_deg_s = 0.0
+            shared_state.local_manual_vz_m_s = 0.0
+            shared_state.local_manual_vy_m_s = -_MANUAL_XY_SPEED_M_S
+            shared_state.local_manual_override_until_s = time.monotonic() + _MANUAL_OVERRIDE_DURATION_S
             shared_state.local_manual_status = "strafe_left"
     elif key in _STRAFE_RIGHT_KEYS:
         async with state_lock:
+            shared_state.local_manual_vx_m_s = 0.0
             shared_state.local_manual_yaw_rate_deg_s = 0.0
             shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = 0.45
-            shared_state.local_manual_override_until_s = time.monotonic() + 0.35
+            shared_state.local_manual_vy_m_s = _MANUAL_XY_SPEED_M_S
+            shared_state.local_manual_override_until_s = time.monotonic() + _MANUAL_OVERRIDE_DURATION_S
             shared_state.local_manual_status = "strafe_right"
+    elif key in _MANUAL_MODE_TOGGLE_KEYS:
+        async with state_lock:
+            shared_state.local_manual_mode_enabled = not shared_state.local_manual_mode_enabled
+            shared_state.local_manual_vx_m_s = 0.0
+            shared_state.local_manual_yaw_rate_deg_s = 0.0
+            shared_state.local_manual_vz_m_s = 0.0
+            shared_state.local_manual_vy_m_s = 0.0
+            shared_state.local_manual_override_until_s = 0.0
+            shared_state.local_manual_status = (
+                "manual_mode" if shared_state.local_manual_mode_enabled else "auto"
+            )
     elif key in _STOP_KEYS:
         async with state_lock:
             shared_state.local_spin_paused = not shared_state.local_spin_paused
+            shared_state.local_manual_vx_m_s = 0.0
             shared_state.local_manual_yaw_rate_deg_s = 0.0
             shared_state.local_manual_vz_m_s = 0.0
             shared_state.local_manual_vy_m_s = 0.0
@@ -735,16 +1130,19 @@ async def _apply_manual_key_input(shared_state, state_lock: asyncio.Lock, key: i
             shared_state.local_manual_status = "hold" if shared_state.local_spin_paused else "auto"
 
 
-async def run_local_runtime() -> int:
-    context = bootstrap_app()
-    settings = context["settings"]
-    logger = context["logger"]
+async def run_local_runtime(settings: dict[str, object] | None = None, logger=None) -> int:
+    if settings is None or logger is None:
+        context = bootstrap_app()
+        settings = context["settings"]
+        logger = context["logger"]
     runtime = settings.get("runtime", {})
+    watchdog_settings = settings.get("watchdog", {})
     local_ui_settings = settings.get("local_ui", {})
     logger.info("Starting local asyncio runtime without AirSim")
     print(f"{settings['app']['name']} startup complete")
 
     from control.obstacle_avoidance import ObstacleAvoidanceController
+    from control.safety import CommandSafetyLimits, CommandSafetyLimiter
     from control.visual_servo import VisualServoConfig, VisualServoController
     from telemetry.models import RuntimeSharedState
     from telemetry.recorder import TelemetryRecorder
@@ -758,6 +1156,8 @@ async def run_local_runtime() -> int:
 
     shared_state = RuntimeSharedState()
     shared_state.local_world = _build_initial_local_world(settings)
+    now_s = time.monotonic()
+    shared_state.loop_heartbeats = {loop_name: now_s for loop_name in _WATCHDOG_LOOP_NAMES}
     state_lock = asyncio.Lock()
     recorder = TelemetryRecorder(
         output_dir=Path("artifacts"),
@@ -774,6 +1174,7 @@ async def run_local_runtime() -> int:
             max_vertical_velocity_m_s=float(control_settings.get("servo_max_vertical_velocity_m_s", 0.4)),
             max_yaw_rate_deg_s=float(control_settings.get("servo_max_yaw_rate_deg_s", 10.0)),
             yaw_error_deadband_px=float(control_settings.get("servo_yaw_error_deadband_px", 10.0)),
+            vertical_error_deadband_px=float(control_settings.get("servo_vertical_error_deadband_px", 12.0)),
             lateral_kp=float(control_settings.get("servo_lateral_kp", 0.4)),
             lateral_ki=float(control_settings.get("servo_lateral_ki", 0.0)),
             lateral_kd=float(control_settings.get("servo_lateral_kd", 0.05)),
@@ -797,6 +1198,25 @@ async def run_local_runtime() -> int:
         command_duration_s=float(depth_settings.get("avoidance_command_duration_s", 0.25)),
         logger=logger,
     )
+    mission_settings = settings.get("mission", {})
+    safety_limiter = CommandSafetyLimiter(
+        CommandSafetyLimits(
+            max_velocity_xy_m_s=float(control_settings.get("max_velocity_xy", 1.0)),
+            max_velocity_z_m_s=float(control_settings.get("max_velocity_z", 0.5)),
+            max_yaw_rate_deg_s=float(control_settings.get("yaw_rate_deg_s", 15.0)),
+            min_command_duration_s=min(
+                float(runtime.get("control_interval_s", 0.2)),
+                float(control_settings.get("approach_command_duration_s", 0.25)),
+            ),
+            max_command_duration_s=max(
+                float(mission_settings.get("search_step_duration_s", 0.35)),
+                float(mission_settings.get("descend_step_duration_s", 0.25)),
+                float(control_settings.get("servo_command_duration_s", 0.2)),
+                float(depth_settings.get("avoidance_command_duration_s", 0.25)),
+                float(control_settings.get("approach_command_duration_s", 0.25)),
+            ),
+        )
+    )
 
     marker_id = int(aruco_settings.get("marker_id", 0))
     telemetry_interval_s = float(runtime.get("telemetry_interval_s", 0.5))
@@ -805,6 +1225,9 @@ async def run_local_runtime() -> int:
     mission_interval_s = float(runtime.get("mission_interval_s", 0.2))
     control_interval_s = float(runtime.get("control_interval_s", 0.2))
     run_duration_s = float(runtime.get("run_duration_s", 3.0))
+    watchdog_enabled = bool(watchdog_settings.get("enabled", True))
+    watchdog_interval_s = float(watchdog_settings.get("loop_interval_s", 0.1))
+    watchdog_stale_after_s = float(watchdog_settings.get("stale_after_s", 1.0))
     local_ui_enabled = bool(local_ui_settings.get("enabled", True))
     local_ui_interval_s = float(local_ui_settings.get("interval_s", 0.03))
     local_ui_window_name = str(local_ui_settings.get("window_name", "drone_cv local"))
@@ -814,25 +1237,49 @@ async def run_local_runtime() -> int:
         asyncio.create_task(local_frame_loop(recorder, settings, shared_state, state_lock, logger, frame_interval_s), name="frame"),
         asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, shared_state, state_lock, logger, vision_interval_s), name="vision"),
         asyncio.create_task(mission_loop(visual_servo, obstacle_avoidance, recorder, settings, shared_state, state_lock, logger, mission_interval_s), name="mission"),
-        asyncio.create_task(local_control_loop(shared_state, state_lock, logger, control_interval_s), name="control"),
+        asyncio.create_task(local_control_loop(safety_limiter, shared_state, state_lock, logger, control_interval_s), name="control"),
     ]
-    if local_ui_enabled:
+    interaction_tasks = []
+    if watchdog_enabled:
         tasks.append(
             asyncio.create_task(
-                local_ui_loop(
-                    shared_state,
-                    state_lock,
-                    logger,
-                    local_ui_interval_s,
-                    local_ui_window_name,
-                ),
-                name="local_ui",
+                watchdog_loop(shared_state, state_lock, logger, watchdog_interval_s, watchdog_stale_after_s),
+                name="watchdog",
             )
         )
+    if local_ui_enabled:
+        local_ui_task = asyncio.create_task(
+            local_ui_loop(
+                shared_state,
+                state_lock,
+                logger,
+                local_ui_interval_s,
+                local_ui_window_name,
+            ),
+            name="local_ui",
+        )
+        tasks.append(local_ui_task)
+        interaction_tasks.append(local_ui_task)
+    if _terminal_controls_available():
+        terminal_task = asyncio.create_task(
+            terminal_control_loop(
+                shared_state,
+                state_lock,
+                logger,
+                0.05,
+                "local",
+            ),
+            name="terminal_control",
+        )
+        tasks.append(terminal_task)
+        interaction_tasks.append(terminal_task)
 
     try:
-        if local_ui_enabled:
-            await next(task for task in tasks if task.get_name() == "local_ui")
+        if interaction_tasks:
+            done, pending = await asyncio.wait(interaction_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*done, return_exceptions=True)
         else:
             await asyncio.sleep(run_duration_s)
     finally:
@@ -1013,8 +1460,8 @@ def _draw_local_camera_overlay(
         f"Obstacle: {'yes' if obstacle_detected else 'no'}",
         f"Mission: {mission_detail}",
         f"Command: {command_reason}",
-        "A/D: yaw | W/S: altitude | J/L: strafe",
-        "Space: toggle auto spin",
+        "A/D: yaw | W/S: altitude | I/K: forward/back | J/L: strafe",
+        "M: toggle manual-only | Space: toggle auto spin",
         "Press Q or Esc to close",
     ]
     y = 28
@@ -1065,8 +1512,8 @@ def _draw_dev_camera_overlay(
         f"state={mission_state} marker={'yes' if marker_detected else 'no'} obstacle={'yes' if obstacle_detected else 'no'}",
         f"mission={mission_detail}",
         f"command={command_reason}",
-        "A/D: yaw | W/S: altitude | J/L: strafe",
-        "Space: pause auto yaw | Q/Esc: exit",
+        "A/D: yaw | W/S: altitude | I/K: forward/back | J/L: strafe",
+        "M: toggle manual-only | Space: pause auto yaw | Q/Esc: exit",
     ]
     y = 28
     for line in lines:
@@ -1170,7 +1617,44 @@ def parse_args() -> argparse.Namespace:
         default="dev",
         help="Run dev, smoke, or local mode",
     )
+    parser.add_argument(
+        "--profile",
+        choices=("default", "safe", "ci"),
+        default="default",
+        help="Apply runtime overrides for default, safe, or ci execution",
+    )
     return parser.parse_args()
+
+
+def apply_runtime_profile(settings: dict[str, object], profile: str, mode: str) -> dict[str, object]:
+    if profile == "default":
+        return settings
+
+    profiled_settings = copy.deepcopy(settings)
+    runtime_settings = profiled_settings.setdefault("runtime", {})
+    recording_settings = profiled_settings.setdefault("recording", {})
+    local_ui_settings = profiled_settings.setdefault("local_ui", {})
+    dev_ui_settings = profiled_settings.setdefault("dev_ui", {})
+    watchdog_settings = profiled_settings.setdefault("watchdog", {})
+    freshness_settings = profiled_settings.setdefault("freshness", {})
+
+    if profile == "safe":
+        runtime_settings["control_interval_s"] = min(float(runtime_settings.get("control_interval_s", 0.2)), 0.15)
+        watchdog_settings["stale_after_s"] = min(float(watchdog_settings.get("stale_after_s", 1.0)), 0.75)
+        freshness_settings["telemetry_max_age_s"] = min(float(freshness_settings.get("telemetry_max_age_s", 1.5)), 1.0)
+        freshness_settings["frames_max_age_s"] = min(float(freshness_settings.get("frames_max_age_s", 1.0)), 0.75)
+        freshness_settings["detection_max_age_s"] = min(float(freshness_settings.get("detection_max_age_s", 1.0)), 0.75)
+        freshness_settings["depth_analysis_max_age_s"] = min(float(freshness_settings.get("depth_analysis_max_age_s", 1.0)), 0.75)
+    elif profile == "ci":
+        runtime_settings["run_duration_s"] = min(float(runtime_settings.get("run_duration_s", 120.0)), 5.0)
+        recording_settings["save_debug_frames"] = False
+        local_ui_settings["enabled"] = False
+        dev_ui_settings["enabled"] = False
+        watchdog_settings["enabled"] = True
+        if mode == "dev":
+            raise ValueError("The 'ci' profile is intended for --mode local or --mode smoke only.")
+
+    return profiled_settings
 
 
 def print_startup_info(settings: dict[str, object], mode: str) -> None:
@@ -1192,9 +1676,9 @@ def fail_with_actionable_error(message: str) -> int:
     return 1
 
 
-def run_smoke_mode() -> int:
+def run_smoke_mode(profile: str) -> int:
     context = bootstrap_app()
-    settings = context["settings"]
+    settings = apply_runtime_profile(context["settings"], profile, mode="smoke")
     logger = context["logger"]
     errors = validate_settings(settings)
     if errors:
@@ -1233,9 +1717,9 @@ def run_smoke_mode() -> int:
     return 0
 
 
-def run_dev_mode() -> int:
+def run_dev_mode(profile: str) -> int:
     context = bootstrap_app()
-    settings = context["settings"]
+    settings = apply_runtime_profile(context["settings"], profile, mode="dev")
     logger = context["logger"]
     errors = validate_settings(settings)
     if errors:
@@ -1245,16 +1729,16 @@ def run_dev_mode() -> int:
     logger.info("Dev mode validated config successfully")
 
     try:
-        return asyncio.run(run_runtime())
+        return asyncio.run(run_runtime(settings=settings, logger=logger))
     except ModuleNotFoundError as exc:
         return fail_with_actionable_error(f"Missing dependency: {exc.name}")
     except Exception as exc:  # pragma: no cover - depends on local AirSim/runtime
         return fail_with_actionable_error(str(exc))
 
 
-def run_local_mode() -> int:
+def run_local_mode(profile: str) -> int:
     context = bootstrap_app()
-    settings = context["settings"]
+    settings = apply_runtime_profile(context["settings"], profile, mode="local")
     logger = context["logger"]
     errors = validate_settings(settings)
     if errors:
@@ -1264,7 +1748,7 @@ def run_local_mode() -> int:
     logger.info("Local mode validated config successfully")
 
     try:
-        return asyncio.run(run_local_runtime())
+        return asyncio.run(run_local_runtime(settings=settings, logger=logger))
     except ModuleNotFoundError as exc:
         return fail_with_actionable_error(f"Missing dependency: {exc.name}")
     except Exception as exc:
@@ -1274,10 +1758,10 @@ def run_local_mode() -> int:
 def main() -> int:
     args = parse_args()
     if args.mode == "smoke":
-        return run_smoke_mode()
+        return run_smoke_mode(args.profile)
     if args.mode == "local":
-        return run_local_mode()
-    return run_dev_mode()
+        return run_local_mode(args.profile)
+    return run_dev_mode(args.profile)
 
 
 if __name__ == "__main__":

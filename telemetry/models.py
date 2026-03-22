@@ -86,16 +86,26 @@ class LocalWorldState:
 @dataclass
 class RuntimeSharedState:
     telemetry: TelemetrySnapshot | None = None
+    telemetry_updated_at_s: float = 0.0
     frames: RuntimeFrameState | None = None
+    frames_updated_at_s: float = 0.0
     detection: Any | None = None
+    detection_updated_at_s: float = 0.0
     depth_analysis: Any | None = None
+    depth_analysis_updated_at_s: float = 0.0
+    loop_heartbeats: dict[str, float] = field(default_factory=dict)
+    watchdog_triggered: bool = False
+    watchdog_reason: str = ""
     local_world: LocalWorldState | None = None
+    local_manual_vx_m_s: float = 0.0
     local_manual_yaw_rate_deg_s: float = 0.0
     local_manual_vz_m_s: float = 0.0
     local_manual_vy_m_s: float = 0.0
     local_manual_override_until_s: float = 0.0
     local_manual_status: str = "auto"
     local_spin_paused: bool = False
+    local_manual_mode_enabled: bool = False
+    shutdown_requested: bool = False
     mission_state: MissionState = MissionState.IDLE
     mission_detail: str = "initializing"
     desired_command: RuntimeControlCommand = field(default_factory=RuntimeControlCommand)

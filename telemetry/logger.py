@@ -12,6 +12,19 @@ def get_logger(name: str = "drone_cv.telemetry") -> logging.Logger:
     return logging.getLogger(name)
 
 
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=True)
+
+
 def format_snapshot(snapshot: TelemetrySnapshot) -> str:
     position = snapshot.position_m
     velocity = snapshot.velocity_m_s

@@ -84,12 +84,35 @@ Local development mode:
 python -m app.main --mode dev
 ```
 
+Profiles:
+```bash
+python -m app.main --mode local --profile default
+python -m app.main --mode local --profile safe
+python -m app.main --mode local --profile ci
+```
+
+Profile behavior:
+- `default`: use values from `config/settings.yaml`
+- `safe`: tighten watchdog and freshness guards for more conservative runtime behavior
+- `ci`: disable OpenCV windows and debug frame saving for automation-friendly execution
+
 `dev` mode opens an OpenCV window by default and supports manual override:
 - `A` / `D`: yaw left / right
 - `W` / `S`: altitude up / down
+- `I` / `K`: forward / backward
 - `J` / `L`: strafe left / right
+- `M`: toggle manual-only mode
 - `Space`: pause/resume automatic yaw behavior
 - `Q` or `Esc`: stop runtime and close the window
+
+The OpenCV debug window for `dev` mode is currently disabled by default:
+```yaml
+dev_ui:
+  enabled: false
+```
+Set `dev_ui.enabled: true` in `config/settings.yaml` if you want the camera debug window back.
+When `dev_ui.enabled: false`, manual controls are read from the terminal where you launched the app.
+In WSL terminals, use the control key followed by `Enter` for reliable input delivery.
 
 Smoke mode:
 ```bash
@@ -105,8 +128,10 @@ Local mode opens an OpenCV window by default. The window shows:
 - left: synthetic camera view used by the vision pipeline
 - right: a 2D top-down world view with the drone, marker, obstacle, heading, and current command
 
-Use `A` / `D` to rotate, `W` / `S` to move the drone higher or lower, `J` / `L` to shift left or right, and `Space` to toggle the automatic spin in local mode.
+Use `A` / `D` to rotate, `W` / `S` to move the drone higher or lower, `I` / `K` to move forward or backward, `J` / `L` to shift left or right, `M` to toggle manual-only mode, and `Space` to toggle the automatic spin in local mode.
 Press `Q` or `Esc` to close it.
+The same controls are also available from the terminal in `dev` mode when the OpenCV window is disabled.
+In WSL terminals, enter the command key and press `Enter`.
 
 Frame capture debug:
 ```bash
@@ -157,6 +182,11 @@ python -m pytest tests/test_aruco_detector.py
 python -m pytest tests/test_depth_analyzer.py
 ```
 
+Stable production-oriented regression suite:
+```bash
+python -m pytest tests/test_pid.py tests/test_mission_manager.py tests/test_precision_landing.py tests/test_profiles.py tests/test_settings_validation.py tests/test_command_safety.py tests/test_watchdog.py tests/test_freshness.py tests/test_logging.py tests/test_aruco_detector.py tests/test_depth_analyzer.py
+```
+
 ## Saved Outputs
 
 Runtime artifacts:
@@ -186,6 +216,21 @@ recording:
 - control loop
 
 Tasks communicate through a shared typed runtime state protected by an `asyncio.Lock`. This keeps sensor ingestion, perception, decision-making, and actuation separated and easier to debug.
+
+The runtime now also includes:
+- strict config validation at startup
+- command safety clamping before control is applied
+- loop heartbeat watchdog protection
+- stale sensor-data protection
+- optional structured JSON logs with `app.log_format: json`
+
+By default, the main runtime does not auto-land when the marker is centered at low altitude:
+```yaml
+mission:
+  auto_descend_on_target: false
+  auto_land_on_target: false
+```
+This keeps the drone holding position near the target instead of descending or triggering landing automatically.
 
 ## Current Limitations
 

@@ -1,6 +1,7 @@
 app:
   name: drone_cv
   log_level: INFO
+  log_format: text
 
 runtime:
   telemetry_interval_s: 0.5
@@ -10,13 +11,24 @@ runtime:
   control_interval_s: 0.2
   run_duration_s: 120.0
 
+watchdog:
+  enabled: true
+  loop_interval_s: 0.1
+  stale_after_s: 1.0
+
+freshness:
+  telemetry_max_age_s: 1.5
+  frames_max_age_s: 1.0
+  detection_max_age_s: 1.0
+  depth_analysis_max_age_s: 1.0
+
 local_ui:
   enabled: true
   interval_s: 0.03
   window_name: "drone_cv local"
 
 dev_ui:
-  enabled: true
+  enabled: false
   interval_s: 0.03
   window_name: "drone_cv dev"
 
@@ -71,6 +83,7 @@ control:
   servo_max_vertical_velocity_m_s: 0.4
   servo_max_yaw_rate_deg_s: 10.0
   servo_yaw_error_deadband_px: 10.0
+  servo_vertical_error_deadband_px: 12.0
   servo_lateral_kp: 0.4
   servo_lateral_ki: 0.0
   servo_lateral_kd: 0.05
@@ -124,7 +137,9 @@ mission:
   descend_marker_area_threshold: 18000.0
   descend_rate_m_s: 0.2
   descend_step_duration_s: 0.25
+  auto_descend_on_target: false
   landing_altitude_m: 0.4
+  auto_land_on_target: false
   complete_wait_s: 2.0
   loop_pause_s: 0.1
   max_steps: 100

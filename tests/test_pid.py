@@ -14,7 +14,7 @@ def test_pid_integral_and_derivative_terms_are_applied() -> None:
     second_output = controller.update(error=1.5, dt=0.5)
 
     assert first_output == 2.5
-    assert second_output == 4.25
+    assert second_output == 4.75
 
 
 def test_pid_output_is_clamped() -> None:

@@ -38,6 +38,7 @@ class VisualServoConfig:
     max_vertical_velocity_m_s: float
     max_yaw_rate_deg_s: float
     yaw_error_deadband_px: float
+    vertical_error_deadband_px: float
     lateral_kp: float
     lateral_ki: float
     lateral_kd: float
@@ -95,13 +96,20 @@ class VisualServoController:
         error_y_px = detection.center_y - frame_center_y
         dt = self.config.command_duration_s
 
-        vy = self.lateral_pid.update(error=-(error_x_px / frame_center_x), dt=dt)
-        vz = self.vertical_pid.update(error=error_y_px / frame_center_y, dt=dt)
-
         yaw_error = 0.0
         if abs(error_x_px) >= self.config.yaw_error_deadband_px:
             yaw_error = -(error_x_px / frame_center_x)
         yaw_rate = self.yaw_pid.update(error=yaw_error, dt=dt)
+
+        lateral_error = 0.0
+        if yaw_error == 0.0:
+            lateral_error = -(error_x_px / frame_center_x)
+        vy = self.lateral_pid.update(error=lateral_error, dt=dt)
+
+        vertical_error = 0.0
+        if abs(error_y_px) >= self.config.vertical_error_deadband_px:
+            vertical_error = error_y_px / frame_center_y
+        vz = self.vertical_pid.update(error=vertical_error, dt=dt)
 
         command = VisualServoCommand(
             vx=0.0,
