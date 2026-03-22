@@ -115,6 +115,8 @@ async def run_runtime(settings: dict[str, object] | None = None, logger=None) ->
     mission_interval_s = float(runtime.get("mission_interval_s", 0.2))
     control_interval_s = float(runtime.get("control_interval_s", 0.2))
     run_duration_s = float(runtime.get("run_duration_s", 3.0))
+    profiling_enabled = bool(runtime.get("profiling_enabled", False))
+    profiling_warn_threshold_ms = float(runtime.get("profiling_warn_threshold_ms", 8.0))
     watchdog_enabled = bool(watchdog_settings.get("enabled", True))
     watchdog_interval_s = float(watchdog_settings.get("loop_interval_s", 0.1))
     watchdog_stale_after_s = float(watchdog_settings.get("stale_after_s", 1.0))
@@ -123,11 +125,11 @@ async def run_runtime(settings: dict[str, object] | None = None, logger=None) ->
     dev_ui_window_name = str(dev_ui_settings.get("window_name", "drone_cv dev"))
 
     tasks = [
-        asyncio.create_task(telemetry_loop(adapter, recorder, shared_state, state_lock, logger, telemetry_interval_s), name="telemetry"),
-        asyncio.create_task(frame_loop(frame_fetcher, shared_state, state_lock, logger, frame_interval_s), name="frame"),
-        asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, shared_state, state_lock, logger, vision_interval_s), name="vision"),
+        asyncio.create_task(telemetry_loop(adapter, recorder, shared_state, state_lock, logger, telemetry_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="telemetry"),
+        asyncio.create_task(frame_loop(frame_fetcher, shared_state, state_lock, logger, frame_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="frame"),
+        asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, shared_state, state_lock, logger, vision_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="vision"),
         asyncio.create_task(mission_loop(visual_servo, obstacle_avoidance, recorder, settings, shared_state, state_lock, logger, mission_interval_s), name="mission"),
-        asyncio.create_task(control_loop(adapter, safety_limiter, shared_state, state_lock, logger, control_interval_s), name="control"),
+        asyncio.create_task(control_loop(adapter, safety_limiter, shared_state, state_lock, logger, control_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="control"),
     ]
     interaction_tasks = []
     if watchdog_enabled:
@@ -253,6 +255,8 @@ async def run_local_runtime(settings: dict[str, object] | None = None, logger=No
     mission_interval_s = float(runtime.get("mission_interval_s", 0.2))
     control_interval_s = float(runtime.get("control_interval_s", 0.2))
     run_duration_s = float(runtime.get("run_duration_s", 3.0))
+    profiling_enabled = bool(runtime.get("profiling_enabled", False))
+    profiling_warn_threshold_ms = float(runtime.get("profiling_warn_threshold_ms", 8.0))
     watchdog_enabled = bool(watchdog_settings.get("enabled", True))
     watchdog_interval_s = float(watchdog_settings.get("loop_interval_s", 0.1))
     watchdog_stale_after_s = float(watchdog_settings.get("stale_after_s", 1.0))
@@ -262,10 +266,10 @@ async def run_local_runtime(settings: dict[str, object] | None = None, logger=No
 
     tasks = [
         asyncio.create_task(local_telemetry_loop(recorder, shared_state, state_lock, logger, telemetry_interval_s), name="telemetry"),
-        asyncio.create_task(local_frame_loop(recorder, settings, shared_state, state_lock, logger, frame_interval_s), name="frame"),
-        asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, shared_state, state_lock, logger, vision_interval_s), name="vision"),
+        asyncio.create_task(local_frame_loop(recorder, settings, shared_state, state_lock, logger, frame_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="frame"),
+        asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, shared_state, state_lock, logger, vision_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="vision"),
         asyncio.create_task(mission_loop(visual_servo, obstacle_avoidance, recorder, settings, shared_state, state_lock, logger, mission_interval_s), name="mission"),
-        asyncio.create_task(local_control_loop(safety_limiter, shared_state, state_lock, logger, control_interval_s), name="control"),
+        asyncio.create_task(local_control_loop(safety_limiter, shared_state, state_lock, logger, control_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="control"),
     ]
     interaction_tasks = []
     if watchdog_enabled:

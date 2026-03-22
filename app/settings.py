@@ -22,6 +22,8 @@ class RuntimeSection(StrictBaseModel):
     mission_interval_s: float = Field(gt=0.0)
     control_interval_s: float = Field(gt=0.0)
     run_duration_s: float = Field(gt=0.0)
+    profiling_enabled: bool = False
+    profiling_warn_threshold_ms: float = Field(gt=0.0)
 
 
 class WatchdogSection(StrictBaseModel):

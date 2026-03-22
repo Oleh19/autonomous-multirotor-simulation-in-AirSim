@@ -37,3 +37,26 @@ def test_manual_mode_toggle_switches_between_manual_and_auto() -> None:
     asyncio.run(apply_manual_key_input(shared_state, state_lock, ord("m")))
     assert shared_state.local_manual_mode_enabled is False
     assert shared_state.local_manual_status == "auto"
+
+
+def test_cyrillic_forward_key_sets_manual_forward_override() -> None:
+    shared_state = RuntimeSharedState()
+    state_lock = asyncio.Lock()
+
+    asyncio.run(apply_manual_key_input(shared_state, state_lock, ord("ш")))
+
+    assert shared_state.local_manual_vx_m_s == 1.0
+    assert shared_state.local_manual_status == "forward"
+
+
+def test_cyrillic_manual_mode_toggle_switches_between_manual_and_auto() -> None:
+    shared_state = RuntimeSharedState()
+    state_lock = asyncio.Lock()
+
+    asyncio.run(apply_manual_key_input(shared_state, state_lock, ord("ь")))
+    assert shared_state.local_manual_mode_enabled is True
+    assert shared_state.local_manual_status == "manual_mode"
+
+    asyncio.run(apply_manual_key_input(shared_state, state_lock, ord("ь")))
+    assert shared_state.local_manual_mode_enabled is False
+    assert shared_state.local_manual_status == "auto"

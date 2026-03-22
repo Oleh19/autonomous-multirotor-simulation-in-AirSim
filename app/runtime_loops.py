@@ -7,6 +7,38 @@ import time
 WATCHDOG_LOOP_NAMES = ("telemetry", "frame", "vision", "mission", "control")
 
 
+def _fetch_and_record_telemetry(adapter, recorder):
+    snapshot = adapter.get_telemetry()
+    recorder.record_telemetry(snapshot)
+    return snapshot
+
+
+def _process_vision_step(
+    detector,
+    depth_analyzer,
+    recorder,
+    marker_id: int,
+    rgb_frame,
+    depth_frame,
+    rgb_timestamp: int,
+):
+    detection = detector.detect(rgb_frame, marker_id)
+    depth_analysis = depth_analyzer.analyze(depth_frame)
+    recorder.maybe_save_debug_frame(rgb_frame, "vision", rgb_timestamp)
+    return detection, depth_analysis
+
+
+def log_profile_if_slow(
+    logger,
+    profiling_enabled: bool,
+    profiling_warn_threshold_ms: float,
+    stage: str,
+    elapsed_ms: float,
+) -> None:
+    if profiling_enabled and elapsed_ms >= profiling_warn_threshold_ms:
+        logger.info("Profile | stage=%s elapsed_ms=%.2f", stage, elapsed_ms)
+
+
 def build_manual_override_command(
     manual_status: str,
     manual_vx_m_s: float,
@@ -148,16 +180,26 @@ async def telemetry_loop(
     state_lock: asyncio.Lock,
     logger,
     interval_s: float,
+    profiling_enabled: bool = False,
+    profiling_warn_threshold_ms: float = 0.0,
 ) -> None:
     from telemetry.logger import format_snapshot
 
     while True:
         await mark_loop_heartbeat(shared_state, state_lock, "telemetry")
-        snapshot = await asyncio.to_thread(adapter.get_telemetry)
-        await asyncio.to_thread(recorder.record_telemetry, snapshot)
+        started_at = time.perf_counter()
+        snapshot = await asyncio.to_thread(_fetch_and_record_telemetry, adapter, recorder)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         async with state_lock:
             shared_state.telemetry = snapshot
             shared_state.telemetry_updated_at_s = time.monotonic()
+        log_profile_if_slow(
+            logger,
+            profiling_enabled,
+            profiling_warn_threshold_ms,
+            "telemetry",
+            elapsed_ms,
+        )
         logger.info("Telemetry loop | %s", format_snapshot(snapshot))
         await asyncio.sleep(interval_s)
 
@@ -168,20 +210,33 @@ async def frame_loop(
     state_lock: asyncio.Lock,
     logger,
     interval_s: float,
+    profiling_enabled: bool = False,
+    profiling_warn_threshold_ms: float = 0.0,
 ) -> None:
     from telemetry.models import RuntimeFrameState
 
     while True:
         await mark_loop_heartbeat(shared_state, state_lock, "frame")
+        started_at = time.perf_counter()
         frame_bundle = await asyncio.to_thread(frame_fetcher.fetch)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         async with state_lock:
+            # FrameFetcher already returns fresh numpy arrays for each fetch, so we can
+            # publish them directly and let consumers copy only when they intend to draw.
             shared_state.frames = RuntimeFrameState(
-                rgb_frame=frame_bundle.rgb_bgr.copy(),
-                depth_frame=frame_bundle.depth_m.copy(),
+                rgb_frame=frame_bundle.rgb_bgr,
+                depth_frame=frame_bundle.depth_m,
                 rgb_timestamp=frame_bundle.rgb_timestamp,
                 depth_timestamp=frame_bundle.depth_timestamp,
             )
             shared_state.frames_updated_at_s = time.monotonic()
+        log_profile_if_slow(
+            logger,
+            profiling_enabled,
+            profiling_warn_threshold_ms,
+            "frame_fetch",
+            elapsed_ms,
+        )
         logger.info(
             "Frame loop | rgb_ts=%s depth_ts=%s",
             frame_bundle.rgb_timestamp,
@@ -199,24 +254,37 @@ async def vision_loop(
     state_lock: asyncio.Lock,
     logger,
     interval_s: float,
+    profiling_enabled: bool = False,
+    profiling_warn_threshold_ms: float = 0.0,
 ) -> None:
     while True:
         await mark_loop_heartbeat(shared_state, state_lock, "vision")
         async with state_lock:
             frames = shared_state.frames
         if frames is not None and frames.rgb_frame is not None and frames.depth_frame is not None:
-            detection = await asyncio.to_thread(detector.detect, frames.rgb_frame, marker_id)
-            depth_analysis = await asyncio.to_thread(depth_analyzer.analyze, frames.depth_frame)
+            started_at = time.perf_counter()
+            detection, depth_analysis = await asyncio.to_thread(
+                _process_vision_step,
+                detector,
+                depth_analyzer,
+                recorder,
+                marker_id,
+                frames.rgb_frame,
+                frames.depth_frame,
+                frames.rgb_timestamp,
+            )
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             async with state_lock:
                 shared_state.detection = detection
                 shared_state.detection_updated_at_s = time.monotonic()
                 shared_state.depth_analysis = depth_analysis
                 shared_state.depth_analysis_updated_at_s = time.monotonic()
-            await asyncio.to_thread(
-                recorder.maybe_save_debug_frame,
-                frames.rgb_frame,
-                "vision",
-                frames.rgb_timestamp,
+            log_profile_if_slow(
+                logger,
+                profiling_enabled,
+                profiling_warn_threshold_ms,
+                "vision_process",
+                elapsed_ms,
             )
             logger.info(
                 "Vision loop | detected=%s area=%.1f obstacle=%s",
@@ -425,6 +493,8 @@ async def control_loop(
     state_lock: asyncio.Lock,
     logger,
     interval_s: float,
+    profiling_enabled: bool = False,
+    profiling_warn_threshold_ms: float = 0.0,
 ) -> None:
     from mission.states import MissionState
     from telemetry.models import RuntimeControlCommand
@@ -478,6 +548,7 @@ async def control_loop(
                 )
             effective_command = safety_limiter.clamp(effective_command)
 
+            started_at = time.perf_counter()
             if mission_state == MissionState.LAND and not manual_active:
                 await asyncio.to_thread(adapter.land)
             elif mission_state in {MissionState.IDLE, MissionState.FAILSAFE} and not manual_active:
@@ -491,8 +562,16 @@ async def control_loop(
                     max(effective_command.duration_s, interval_s),
                     effective_command.yaw_rate,
                 )
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             async with state_lock:
                 shared_state.control_applied = True
+            log_profile_if_slow(
+                logger,
+                profiling_enabled,
+                profiling_warn_threshold_ms,
+                "control_apply",
+                elapsed_ms,
+            )
             logger.info(
                 "Control loop | state=%s manual=%s manual_mode=%s vx=%.3f vy=%.3f vz=%.3f yaw_rate=%.3f command=%s",
                 mission_state.value,

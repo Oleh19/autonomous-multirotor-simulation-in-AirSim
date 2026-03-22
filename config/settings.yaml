@@ -10,6 +10,8 @@ runtime:
   mission_interval_s: 0.2
   control_interval_s: 0.2
   run_duration_s: 120.0
+  profiling_enabled: false
+  profiling_warn_threshold_ms: 8.0
 
 watchdog:
   enabled: true

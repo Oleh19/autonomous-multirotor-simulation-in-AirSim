@@ -10,7 +10,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.local_runtime import apply_manual_key_input
+from app.local_runtime import apply_manual_key_input, is_supported_manual_key
 from app.local_world import draw_dev_camera_overlay
 
 
@@ -133,12 +133,12 @@ async def dev_ui_loop(
             ),
         )
         cv2.imshow(window_name, frame)
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKeyEx(1)
 
-        if key in {27, ord("q"), ord("Q")}:
+        if key in {27, ord("q"), ord("Q"), ord("й"), ord("Й")}:
             logger.info("Dev UI loop requested shutdown")
             return
-        if key != 255:
+        if key != -1:
             await apply_manual_key_input(shared_state, state_lock, key)
         await asyncio.sleep(interval_s)
 
@@ -156,8 +156,9 @@ async def terminal_control_loop(
 
     controls_hint = (
         f"{mode_name} terminal controls: A/D yaw | W/S altitude | I/K forward/back | "
-        "J/L strafe | Space pause auto yaw | Q quit"
+        "J/L strafe | M manual-only | Space pause auto yaw | Q quit"
     )
+    controls_hint += " | ru-layout: Ф/В Ц/Ы Ш/Л О/Д Ь"
     if running_in_wsl():
         controls_hint += " | in WSL terminals, type the key and press Enter"
     print(controls_hint)
@@ -168,11 +169,11 @@ async def terminal_control_loop(
                 await asyncio.sleep(interval_s)
                 continue
 
-            if key_text in {"q", "Q", "\x1b"}:
+            if key_text in {"q", "Q", "й", "Й", "\x1b"}:
                 async with state_lock:
                     shared_state.shutdown_requested = True
                 logger.info("Terminal control requested shutdown")
                 return
 
-            if key_text in {" ", "a", "A", "d", "D", "w", "W", "s", "S", "i", "I", "k", "K", "j", "J", "l", "L", "m", "M"}:
+            if len(key_text) == 1 and is_supported_manual_key(ord(key_text)):
                 await apply_manual_key_input(shared_state, state_lock, ord(key_text))

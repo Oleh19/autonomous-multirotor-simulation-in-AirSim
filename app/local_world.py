@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 
 
@@ -64,6 +65,59 @@ def build_initial_local_world(settings):
     )
 
 
+def snapshot_local_world(world):
+    from telemetry.models import LocalObstacleState, LocalWorldState
+
+    return LocalWorldState(
+        width_m=world.width_m,
+        height_m=world.height_m,
+        min_altitude_m=world.min_altitude_m,
+        max_altitude_m=world.max_altitude_m,
+        drone_x_m=world.drone_x_m,
+        drone_y_m=world.drone_y_m,
+        altitude_m=world.altitude_m,
+        yaw_deg=world.yaw_deg,
+        velocity_x_m_s=world.velocity_x_m_s,
+        velocity_y_m_s=world.velocity_y_m_s,
+        velocity_z_m_s=world.velocity_z_m_s,
+        yaw_rate_deg_s=world.yaw_rate_deg_s,
+        marker_x_m=world.marker_x_m,
+        marker_y_m=world.marker_y_m,
+        marker_visible=world.marker_visible,
+        marker_distance_m=world.marker_distance_m,
+        obstacle_distance_m=world.obstacle_distance_m,
+        obstacle_side=world.obstacle_side,
+        obstacle=LocalObstacleState(
+            x_m=world.obstacle.x_m,
+            y_m=world.obstacle.y_m,
+            radius_m=world.obstacle.radius_m,
+        ),
+    )
+
+
+@lru_cache(maxsize=8)
+def _get_aruco_dictionary(dictionary_name: str):
+    import cv2
+
+    return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
+
+
+@lru_cache(maxsize=64)
+def _get_marker_bgr(
+    dictionary_name: str,
+    marker_id: int,
+    marker_size_px: int,
+):
+    import cv2
+    import numpy as np
+
+    dictionary = _get_aruco_dictionary(dictionary_name)
+    marker = cv2.aruco.generateImageMarker(dictionary, marker_id, marker_size_px)
+    marker_bgr = np.full((marker_size_px, marker_size_px, 3), 255, dtype=np.uint8)
+    marker_bgr[marker == 0] = (70, 170, 70)
+    return marker_bgr
+
+
 def render_local_world_frame(settings, world):
     import cv2
     import numpy as np
@@ -109,10 +163,7 @@ def render_local_world_frame(settings, world):
         top = center_y - (marker_size_px // 2)
         left = center_x - (marker_size_px // 2)
         if top >= 0 and left >= 0 and top + marker_size_px < height and left + marker_size_px < width:
-            dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
-            marker = cv2.aruco.generateImageMarker(dictionary, marker_id, marker_size_px)
-            marker_bgr = np.full((marker_size_px, marker_size_px, 3), 255, dtype=np.uint8)
-            marker_bgr[marker == 0] = (70, 170, 70)
+            marker_bgr = _get_marker_bgr(dictionary_name, marker_id, marker_size_px)
             frame[top : top + marker_size_px, left : left + marker_size_px] = marker_bgr
 
     obstacle_distance_m = None

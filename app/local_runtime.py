@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import math
 import time
 
@@ -10,23 +9,43 @@ from app.local_world import (
     build_local_ui_canvas,
     draw_local_camera_overlay,
     render_local_world_frame,
+    snapshot_local_world,
 )
-from app.runtime_loops import build_manual_override_command, mark_loop_heartbeat
+from app.runtime_loops import (
+    build_manual_override_command,
+    log_profile_if_slow,
+    mark_loop_heartbeat,
+)
 
-LEFT_KEYS = {ord("a"), ord("A")}
-RIGHT_KEYS = {ord("d"), ord("D")}
-UP_KEYS = {ord("w"), ord("W")}
-DOWN_KEYS = {ord("s"), ord("S")}
-FORWARD_KEYS = {ord("i"), ord("I")}
-BACKWARD_KEYS = {ord("k"), ord("K")}
-STRAFE_LEFT_KEYS = {ord("j"), ord("J")}
-STRAFE_RIGHT_KEYS = {ord("l"), ord("L")}
+LEFT_KEYS = {ord("a"), ord("A"), ord("ф"), ord("Ф")}
+RIGHT_KEYS = {ord("d"), ord("D"), ord("в"), ord("В")}
+UP_KEYS = {ord("w"), ord("W"), ord("ц"), ord("Ц")}
+DOWN_KEYS = {ord("s"), ord("S"), ord("ы"), ord("Ы")}
+FORWARD_KEYS = {ord("i"), ord("I"), ord("ш"), ord("Ш")}
+BACKWARD_KEYS = {ord("k"), ord("K"), ord("л"), ord("Л")}
+STRAFE_LEFT_KEYS = {ord("j"), ord("J"), ord("о"), ord("О")}
+STRAFE_RIGHT_KEYS = {ord("l"), ord("L"), ord("д"), ord("Д")}
 STOP_KEYS = {32}
-MANUAL_MODE_TOGGLE_KEYS = {ord("m"), ord("M")}
+MANUAL_MODE_TOGGLE_KEYS = {ord("m"), ord("M"), ord("ь"), ord("Ь")}
 MANUAL_OVERRIDE_DURATION_S = 0.8
 MANUAL_XY_SPEED_M_S = 1.0
 MANUAL_Z_SPEED_M_S = 0.5
 MANUAL_YAW_RATE_DEG_S = 25.0
+
+
+def is_supported_manual_key(key: int) -> bool:
+    return key in (
+        LEFT_KEYS
+        | RIGHT_KEYS
+        | UP_KEYS
+        | DOWN_KEYS
+        | FORWARD_KEYS
+        | BACKWARD_KEYS
+        | STRAFE_LEFT_KEYS
+        | STRAFE_RIGHT_KEYS
+        | STOP_KEYS
+        | MANUAL_MODE_TOGGLE_KEYS
+    )
 
 
 async def local_telemetry_loop(
@@ -84,6 +103,8 @@ async def local_frame_loop(
     state_lock: asyncio.Lock,
     logger,
     interval_s: float,
+    profiling_enabled: bool = False,
+    profiling_warn_threshold_ms: float = 0.0,
 ) -> None:
     from telemetry.models import RuntimeFrameState
 
@@ -95,10 +116,12 @@ async def local_frame_loop(
             await asyncio.sleep(interval_s)
             continue
 
+        started_at = time.perf_counter()
         frame, depth, marker_visible, marker_distance_m, obstacle_distance_m, obstacle_side = (
             render_local_world_frame(settings, world)
         )
-        frame_world_snapshot = copy.deepcopy(world)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        frame_world_snapshot = snapshot_local_world(world)
         frame_world_snapshot.marker_visible = marker_visible
         frame_world_snapshot.marker_distance_m = marker_distance_m
         frame_world_snapshot.obstacle_distance_m = obstacle_distance_m
@@ -118,6 +141,13 @@ async def local_frame_loop(
             shared_state.local_world.marker_distance_m = marker_distance_m
             shared_state.local_world.obstacle_distance_m = obstacle_distance_m
             shared_state.local_world.obstacle_side = obstacle_side
+        log_profile_if_slow(
+            logger,
+            profiling_enabled,
+            profiling_warn_threshold_ms,
+            "local_frame_render",
+            elapsed_ms,
+        )
         await asyncio.to_thread(recorder.maybe_save_debug_frame, frame, "local", timestamp)
         logger.info(
             "Local frame | marker_visible=%s marker_distance=%.2f obstacle=%s",
@@ -134,6 +164,8 @@ async def local_control_loop(
     state_lock: asyncio.Lock,
     logger,
     interval_s: float,
+    profiling_enabled: bool = False,
+    profiling_warn_threshold_ms: float = 0.0,
 ) -> None:
     while True:
         await mark_loop_heartbeat(shared_state, state_lock, "control")
@@ -192,8 +224,10 @@ async def local_control_loop(
                     reason=f"{command.reason} | auto spin paused",
                 )
             effective_command = safety_limiter.clamp(effective_command)
+            started_at = time.perf_counter()
             if world is not None:
                 apply_local_command(world, effective_command, max(effective_command.duration_s, interval_s))
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             logger.info(
                 "Local control | state=%s manual_mode=%s x=%.2f y=%.2f alt=%.2f yaw=%.1f vx=%.3f vy=%.3f vz=%.3f yaw_rate=%.3f reason=%s",
                 mission_state.value,
@@ -210,6 +244,13 @@ async def local_control_loop(
             )
             async with state_lock:
                 shared_state.control_applied = True
+            log_profile_if_slow(
+                logger,
+                profiling_enabled,
+                profiling_warn_threshold_ms,
+                "local_control_apply",
+                elapsed_ms,
+            )
         await asyncio.sleep(interval_s)
 
 
@@ -259,11 +300,11 @@ async def local_ui_loop(
                 ),
             )
             cv2.imshow(window_name, canvas)
-            key = cv2.waitKey(1) & 0xFF
-            if key in {27, ord("q")}:
+            key = cv2.waitKeyEx(1)
+            if key in {27, ord("q"), ord("Q"), ord("й"), ord("Й")}:
                 logger.info("Local UI loop requested shutdown")
                 return
-            if key != 255:
+            if key != -1:
                 await apply_manual_key_input(shared_state, state_lock, key)
         await asyncio.sleep(interval_s)
 
