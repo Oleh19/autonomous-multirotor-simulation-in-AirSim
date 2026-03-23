@@ -26,15 +26,16 @@ BACKWARD_KEYS = {ord("k"), ord("K"), ord("л"), ord("Л")}
 STRAFE_LEFT_KEYS = {ord("j"), ord("J"), ord("о"), ord("О")}
 STRAFE_RIGHT_KEYS = {ord("l"), ord("L"), ord("д"), ord("Д")}
 STOP_KEYS = {32}
+AUTOPILOT_TOGGLE_KEYS = {ord("p"), ord("P"), ord("з"), ord("З")}
 MANUAL_MODE_TOGGLE_KEYS = {ord("m"), ord("M"), ord("ь"), ord("Ь")}
 MANUAL_OVERRIDE_DURATION_S = 0.8
 MANUAL_XY_SPEED_M_S = 1.0
 MANUAL_Z_SPEED_M_S = 0.5
-MANUAL_YAW_RATE_DEG_S = 25.0
+MANUAL_YAW_RATE_DEG_S = 10.0
 
 
-def is_supported_manual_key(key: int) -> bool:
-    return key in (
+def _supported_manual_keys() -> set[int]:
+    return (
         LEFT_KEYS
         | RIGHT_KEYS
         | UP_KEYS
@@ -44,8 +45,93 @@ def is_supported_manual_key(key: int) -> bool:
         | STRAFE_LEFT_KEYS
         | STRAFE_RIGHT_KEYS
         | STOP_KEYS
+        | AUTOPILOT_TOGGLE_KEYS
         | MANUAL_MODE_TOGGLE_KEYS
     )
+
+
+def is_supported_manual_key(key: int) -> bool:
+    return key in _supported_manual_keys()
+
+
+def normalize_manual_key(key: int) -> int | None:
+    if key < 0:
+        return None
+
+    supported_keys = _supported_manual_keys()
+    if key in supported_keys:
+        return key
+
+    low_byte_key = key & 0xFF
+    if low_byte_key in supported_keys:
+        return low_byte_key
+
+    try:
+        key_text = chr(key)
+    except (OverflowError, ValueError):
+        return None
+
+    for candidate in (key_text, key_text.lower(), key_text.upper()):
+        if len(candidate) == 1 and ord(candidate) in supported_keys:
+            return ord(candidate)
+
+    return None
+
+
+async def _activate_local_manual_override(
+    shared_state,
+    state_lock: asyncio.Lock,
+    *,
+    vx_m_s: float,
+    vy_m_s: float,
+    vz_m_s: float,
+    yaw_rate_deg_s: float,
+    status: str,
+) -> None:
+    async with state_lock:
+        shared_state.local_manual_vx_m_s = vx_m_s
+        shared_state.local_manual_yaw_rate_deg_s = yaw_rate_deg_s
+        shared_state.local_manual_vz_m_s = vz_m_s
+        shared_state.local_manual_vy_m_s = vy_m_s
+        shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
+        shared_state.local_manual_status = status
+        shared_state.control_applied = False
+        # Local mode should always let the operator recover control after a transient stall.
+        shared_state.watchdog_triggered = False
+        shared_state.watchdog_reason = ""
+
+
+async def _reset_local_manual_state(
+    shared_state,
+    state_lock: asyncio.Lock,
+    *,
+    status: str,
+) -> None:
+    async with state_lock:
+        shared_state.local_manual_vx_m_s = 0.0
+        shared_state.local_manual_yaw_rate_deg_s = 0.0
+        shared_state.local_manual_vz_m_s = 0.0
+        shared_state.local_manual_vy_m_s = 0.0
+        shared_state.local_manual_override_until_s = 0.0
+        shared_state.local_manual_status = status
+        shared_state.control_applied = False
+        shared_state.watchdog_triggered = False
+        shared_state.watchdog_reason = ""
+
+
+async def _set_autopilot_target_lock_on_toggle(shared_state, state_lock: asyncio.Lock) -> None:
+    async with state_lock:
+        detection = shared_state.detection
+        if detection is not None and detection.detected and detection.marker_id is not None:
+            shared_state.local_autopilot_target_locked = True
+            shared_state.local_autopilot_target_marker_id = detection.marker_id
+            shared_state.last_target_detection = detection
+            shared_state.last_target_seen_at_s = time.monotonic()
+        else:
+            shared_state.local_autopilot_target_locked = False
+            shared_state.local_autopilot_target_marker_id = None
+            shared_state.last_target_detection = None
+            shared_state.last_target_seen_at_s = 0.0
 
 
 async def local_telemetry_loop(
@@ -184,9 +270,19 @@ async def local_control_loop(
             manual_mode_enabled = shared_state.local_manual_mode_enabled
             watchdog_triggered = shared_state.watchdog_triggered
             watchdog_reason = shared_state.watchdog_reason
-        if not already_applied:
+        manual_active = time.monotonic() < manual_override_until_s
+        if manual_active or not already_applied:
             effective_command = command
-            if watchdog_triggered:
+            if manual_active:
+                effective_command = build_manual_override_command(
+                    manual_status=manual_status,
+                    manual_vx_m_s=manual_vx_m_s,
+                    manual_vy_m_s=manual_vy_m_s,
+                    manual_vz_m_s=manual_vz_m_s,
+                    manual_yaw_rate_deg_s=manual_yaw_rate_deg_s,
+                    duration_s=max(command.duration_s, interval_s),
+                )
+            elif watchdog_triggered:
                 from telemetry.models import RuntimeControlCommand
 
                 effective_command = RuntimeControlCommand(
@@ -201,15 +297,6 @@ async def local_control_loop(
                     duration_s=max(command.duration_s, interval_s),
                     source="failsafe",
                     reason=command.reason,
-                )
-            elif time.monotonic() < manual_override_until_s:
-                effective_command = build_manual_override_command(
-                    manual_status=manual_status,
-                    manual_vx_m_s=manual_vx_m_s,
-                    manual_vy_m_s=manual_vy_m_s,
-                    manual_vz_m_s=manual_vz_m_s,
-                    manual_yaw_rate_deg_s=manual_yaw_rate_deg_s,
-                    duration_s=max(command.duration_s, interval_s),
                 )
             elif spin_paused:
                 from telemetry.models import RuntimeControlCommand
@@ -275,6 +362,7 @@ async def local_ui_loop(
             manual_override_until_s = shared_state.local_manual_override_until_s
             spin_paused = shared_state.local_spin_paused
             manual_mode_enabled = shared_state.local_manual_mode_enabled
+            autopilot_enabled = shared_state.local_autopilot_enabled
 
         if frames is not None and frames.rgb_frame is not None and world is not None:
             view_world = frames.local_world_snapshot if frames.local_world_snapshot is not None else world
@@ -296,101 +384,151 @@ async def local_ui_loop(
                 (
                     "manual-only"
                     if manual_mode_enabled
-                    else ("manual" if time.monotonic() < manual_override_until_s else ("paused" if spin_paused else "auto"))
+                    else (
+                        "autopilot-off"
+                        if not autopilot_enabled
+                        else (
+                            "manual"
+                            if time.monotonic() < manual_override_until_s
+                            else ("paused" if spin_paused else "auto")
+                        )
+                    )
                 ),
             )
             cv2.imshow(window_name, canvas)
             key = cv2.waitKeyEx(1)
+            normalized_key = normalize_manual_key(key)
             if key in {27, ord("q"), ord("Q"), ord("й"), ord("Й")}:
+                async with state_lock:
+                    shared_state.shutdown_requested = True
                 logger.info("Local UI loop requested shutdown")
                 return
-            if key != -1:
-                await apply_manual_key_input(shared_state, state_lock, key)
+            if normalized_key is not None:
+                await apply_manual_key_input(shared_state, state_lock, normalized_key)
         await asyncio.sleep(interval_s)
 
 
 async def apply_manual_key_input(shared_state, state_lock: asyncio.Lock, key: int) -> None:
     if key in LEFT_KEYS:
-        async with state_lock:
-            shared_state.local_manual_vx_m_s = 0.0
-            shared_state.local_manual_yaw_rate_deg_s = -MANUAL_YAW_RATE_DEG_S
-            shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
-            shared_state.local_manual_status = "left"
+        await _activate_local_manual_override(
+            shared_state,
+            state_lock,
+            vx_m_s=0.0,
+            vy_m_s=0.0,
+            vz_m_s=0.0,
+            yaw_rate_deg_s=-MANUAL_YAW_RATE_DEG_S,
+            status="left",
+        )
     elif key in RIGHT_KEYS:
-        async with state_lock:
-            shared_state.local_manual_vx_m_s = 0.0
-            shared_state.local_manual_yaw_rate_deg_s = MANUAL_YAW_RATE_DEG_S
-            shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
-            shared_state.local_manual_status = "right"
+        await _activate_local_manual_override(
+            shared_state,
+            state_lock,
+            vx_m_s=0.0,
+            vy_m_s=0.0,
+            vz_m_s=0.0,
+            yaw_rate_deg_s=MANUAL_YAW_RATE_DEG_S,
+            status="right",
+        )
     elif key in UP_KEYS:
-        async with state_lock:
-            shared_state.local_manual_vx_m_s = 0.0
-            shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = -MANUAL_Z_SPEED_M_S
-            shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
-            shared_state.local_manual_status = "up"
+        await _activate_local_manual_override(
+            shared_state,
+            state_lock,
+            vx_m_s=0.0,
+            vy_m_s=0.0,
+            vz_m_s=-MANUAL_Z_SPEED_M_S,
+            yaw_rate_deg_s=0.0,
+            status="up",
+        )
     elif key in DOWN_KEYS:
-        async with state_lock:
-            shared_state.local_manual_vx_m_s = 0.0
-            shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = MANUAL_Z_SPEED_M_S
-            shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
-            shared_state.local_manual_status = "down"
+        await _activate_local_manual_override(
+            shared_state,
+            state_lock,
+            vx_m_s=0.0,
+            vy_m_s=0.0,
+            vz_m_s=MANUAL_Z_SPEED_M_S,
+            yaw_rate_deg_s=0.0,
+            status="down",
+        )
     elif key in FORWARD_KEYS:
-        async with state_lock:
-            shared_state.local_manual_vx_m_s = MANUAL_XY_SPEED_M_S
-            shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
-            shared_state.local_manual_status = "forward"
+        await _activate_local_manual_override(
+            shared_state,
+            state_lock,
+            vx_m_s=MANUAL_XY_SPEED_M_S,
+            vy_m_s=0.0,
+            vz_m_s=0.0,
+            yaw_rate_deg_s=0.0,
+            status="forward",
+        )
     elif key in BACKWARD_KEYS:
-        async with state_lock:
-            shared_state.local_manual_vx_m_s = -MANUAL_XY_SPEED_M_S
-            shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
-            shared_state.local_manual_status = "backward"
+        await _activate_local_manual_override(
+            shared_state,
+            state_lock,
+            vx_m_s=-MANUAL_XY_SPEED_M_S,
+            vy_m_s=0.0,
+            vz_m_s=0.0,
+            yaw_rate_deg_s=0.0,
+            status="backward",
+        )
     elif key in STRAFE_LEFT_KEYS:
-        async with state_lock:
-            shared_state.local_manual_vx_m_s = 0.0
-            shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = -MANUAL_XY_SPEED_M_S
-            shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
-            shared_state.local_manual_status = "strafe_left"
+        await _activate_local_manual_override(
+            shared_state,
+            state_lock,
+            vx_m_s=0.0,
+            vy_m_s=-MANUAL_XY_SPEED_M_S,
+            vz_m_s=0.0,
+            yaw_rate_deg_s=0.0,
+            status="strafe_left",
+        )
     elif key in STRAFE_RIGHT_KEYS:
-        async with state_lock:
-            shared_state.local_manual_vx_m_s = 0.0
-            shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = MANUAL_XY_SPEED_M_S
-            shared_state.local_manual_override_until_s = time.monotonic() + MANUAL_OVERRIDE_DURATION_S
-            shared_state.local_manual_status = "strafe_right"
+        await _activate_local_manual_override(
+            shared_state,
+            state_lock,
+            vx_m_s=0.0,
+            vy_m_s=MANUAL_XY_SPEED_M_S,
+            vz_m_s=0.0,
+            yaw_rate_deg_s=0.0,
+            status="strafe_right",
+        )
     elif key in MANUAL_MODE_TOGGLE_KEYS:
         async with state_lock:
             shared_state.local_manual_mode_enabled = not shared_state.local_manual_mode_enabled
-            shared_state.local_manual_vx_m_s = 0.0
-            shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = 0.0
-            shared_state.local_manual_status = (
-                "manual_mode" if shared_state.local_manual_mode_enabled else "auto"
-            )
+            if shared_state.local_manual_mode_enabled:
+                shared_state.local_autopilot_enabled = False
+                shared_state.local_autopilot_target_locked = False
+                shared_state.local_autopilot_target_marker_id = None
+                shared_state.last_target_detection = None
+                shared_state.last_target_seen_at_s = 0.0
+            else:
+                shared_state.local_autopilot_enabled = True
+        await _reset_local_manual_state(
+            shared_state,
+            state_lock,
+            status="manual_mode" if shared_state.local_manual_mode_enabled else "auto",
+        )
+        if not shared_state.local_manual_mode_enabled:
+            await _set_autopilot_target_lock_on_toggle(shared_state, state_lock)
+    elif key in AUTOPILOT_TOGGLE_KEYS:
+        async with state_lock:
+            shared_state.local_autopilot_enabled = not shared_state.local_autopilot_enabled
+            if shared_state.local_autopilot_enabled:
+                shared_state.local_manual_mode_enabled = False
+            else:
+                shared_state.local_autopilot_target_locked = False
+                shared_state.local_autopilot_target_marker_id = None
+                shared_state.last_target_detection = None
+                shared_state.last_target_seen_at_s = 0.0
+        await _reset_local_manual_state(
+            shared_state,
+            state_lock,
+            status="autopilot_on" if shared_state.local_autopilot_enabled else "autopilot_off",
+        )
+        if shared_state.local_autopilot_enabled:
+            await _set_autopilot_target_lock_on_toggle(shared_state, state_lock)
     elif key in STOP_KEYS:
         async with state_lock:
             shared_state.local_spin_paused = not shared_state.local_spin_paused
-            shared_state.local_manual_vx_m_s = 0.0
-            shared_state.local_manual_yaw_rate_deg_s = 0.0
-            shared_state.local_manual_vz_m_s = 0.0
-            shared_state.local_manual_vy_m_s = 0.0
-            shared_state.local_manual_override_until_s = 0.0
-            shared_state.local_manual_status = "hold" if shared_state.local_spin_paused else "auto"
+        await _reset_local_manual_state(
+            shared_state,
+            state_lock,
+            status="hold" if shared_state.local_spin_paused else "auto",
+        )

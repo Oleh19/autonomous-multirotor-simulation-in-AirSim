@@ -28,6 +28,40 @@ def _process_vision_step(
     return detection, depth_analysis
 
 
+def _build_local_partial_detection(settings, local_world_snapshot, target_marker_id: int):
+    from app.local_world import project_local_marker
+    from vision.aruco_detector import ArucoDetection
+
+    projection = project_local_marker(settings, local_world_snapshot)
+    if not projection.visible_in_frame or projection.marker_size_px <= 0:
+        return None
+
+    half_size = projection.marker_size_px / 2.0
+    left = projection.center_x_px - half_size
+    top = projection.center_y_px - half_size
+    right = projection.center_x_px + half_size
+    bottom = projection.center_y_px + half_size
+    clipped_width = max(0.0, float(projection.clipped_right_px - projection.clipped_left_px))
+    clipped_height = max(0.0, float(projection.clipped_bottom_px - projection.clipped_top_px))
+    visible_area = clipped_width * clipped_height
+    if visible_area <= 0.0:
+        return None
+
+    return ArucoDetection(
+        detected=True,
+        marker_id=target_marker_id,
+        center_x=float(projection.center_x_px),
+        center_y=float(projection.center_y_px),
+        corners=(
+            (float(left), float(top)),
+            (float(right), float(top)),
+            (float(right), float(bottom)),
+            (float(left), float(bottom)),
+        ),
+        area=visible_area,
+    )
+
+
 def log_profile_if_slow(
     logger,
     profiling_enabled: bool,
@@ -37,6 +71,70 @@ def log_profile_if_slow(
 ) -> None:
     if profiling_enabled and elapsed_ms >= profiling_warn_threshold_ms:
         logger.info("Profile | stage=%s elapsed_ms=%.2f", stage, elapsed_ms)
+
+
+def build_target_tracking_command(
+    servo_command,
+    *,
+    aligned: bool,
+    approach_forward_speed_m_s: float,
+    visible_tracking_forward_speed_m_s: float,
+    frame_width: int,
+    frame_height: int,
+):
+    from telemetry.models import RuntimeControlCommand
+
+    horizontal_error_ratio = min(1.0, abs(servo_command.error_x_px) / max(frame_width / 2.0, 1.0))
+    vertical_error_ratio = min(1.0, abs(servo_command.error_y_px) / max(frame_height / 2.0, 1.0))
+    dominant_error_ratio = max(horizontal_error_ratio, vertical_error_ratio)
+    forward_speed_m_s = visible_tracking_forward_speed_m_s + (
+        (approach_forward_speed_m_s - visible_tracking_forward_speed_m_s)
+        * max(0.0, 1.0 - dominant_error_ratio)
+    )
+
+    if aligned:
+        return RuntimeControlCommand(
+            vx=approach_forward_speed_m_s,
+            vy=servo_command.vy,
+            vz=servo_command.vz,
+            yaw_rate=servo_command.yaw_rate,
+            duration_s=servo_command.duration_s,
+            source="mission_loop",
+            reason="marker aligned; continuous approach",
+        )
+
+    return RuntimeControlCommand(
+        vx=forward_speed_m_s,
+        vy=servo_command.vy,
+        vz=servo_command.vz,
+        yaw_rate=servo_command.yaw_rate,
+        duration_s=servo_command.duration_s,
+        source="mission_loop",
+        reason="marker visible; track and re-center while approaching",
+    )
+
+
+def should_keep_recent_target_lock(
+    *,
+    target_locked: bool,
+    detection,
+    last_target_detection,
+    last_target_seen_at_s: float,
+    now_s: float,
+    target_memory_timeout_s: float,
+):
+    if not target_locked:
+        return detection
+    if detection is not None and detection.detected:
+        return detection
+    if (
+        last_target_detection is not None
+        and last_target_detection.detected
+        and last_target_seen_at_s > 0.0
+        and (now_s - last_target_seen_at_s) <= target_memory_timeout_s
+    ):
+        return last_target_detection
+    return detection
 
 
 def build_manual_override_command(
@@ -250,6 +348,7 @@ async def vision_loop(
     depth_analyzer,
     recorder,
     marker_id: int,
+    settings,
     shared_state,
     state_lock: asyncio.Lock,
     logger,
@@ -273,6 +372,17 @@ async def vision_loop(
                 frames.depth_frame,
                 frames.rgb_timestamp,
             )
+            if (
+                not detection.detected
+                and frames.local_world_snapshot is not None
+            ):
+                partial_detection = _build_local_partial_detection(
+                    settings=settings,
+                    local_world_snapshot=frames.local_world_snapshot,
+                    target_marker_id=marker_id,
+                )
+                if partial_detection is not None:
+                    detection = partial_detection
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             async with state_lock:
                 shared_state.detection = detection
@@ -312,14 +422,21 @@ async def mission_loop(
     aruco_settings = settings.get("aruco", {})
     freshness_settings = settings.get("freshness", {})
     mission_settings = settings.get("mission", {})
-    target_marker_area = float(control_settings.get("approach_target_marker_area", 12000.0))
     center_tolerance_px = float(control_settings.get("approach_center_tolerance_px", 30.0))
     command_duration_s = float(control_settings.get("approach_command_duration_s", 0.25))
     forward_speed_m_s = float(control_settings.get("approach_forward_speed_m_s", 0.4))
+    visible_tracking_forward_speed_m_s = float(
+        control_settings.get("track_visible_forward_speed_m_s", 0.08)
+    )
+    target_memory_timeout_s = float(control_settings.get("target_memory_timeout_s", 0.75))
     target_marker_id = int(aruco_settings.get("marker_id", 0))
     auto_descend_on_target = bool(mission_settings.get("auto_descend_on_target", False))
     auto_land_on_target = bool(mission_settings.get("auto_land_on_target", False))
+    avoidance_forward_speed_m_s = float(mission_settings.get("avoidance_forward_speed_m_s", 0.15))
+    avoidance_clear_cycles = int(mission_settings.get("avoidance_clear_cycles", 3))
     last_event_key: tuple[str, str] | None = None
+    avoidance_side_lock = "none"
+    avoidance_clear_cycles_remaining = 0
 
     while True:
         await mark_loop_heartbeat(shared_state, state_lock, "mission")
@@ -332,11 +449,25 @@ async def mission_loop(
             watchdog_triggered = shared_state.watchdog_triggered
             watchdog_reason = shared_state.watchdog_reason
             manual_mode_enabled = shared_state.local_manual_mode_enabled
+            autopilot_enabled = shared_state.local_autopilot_enabled
+            target_locked = shared_state.local_autopilot_target_locked
+            locked_target_marker_id = shared_state.local_autopilot_target_marker_id
+            last_target_detection = shared_state.last_target_detection
+            last_target_seen_at_s = shared_state.last_target_seen_at_s
             stale_sensor_names = find_stale_sensor_names(
                 shared_state,
                 time.monotonic(),
                 freshness_settings,
             )
+        now_s = time.monotonic()
+        detection_for_guidance = should_keep_recent_target_lock(
+            target_locked=target_locked,
+            detection=detection,
+            last_target_detection=last_target_detection,
+            last_target_seen_at_s=last_target_seen_at_s,
+            now_s=now_s,
+            target_memory_timeout_s=target_memory_timeout_s,
+        )
 
         mission_state = current_state
         mission_detail = "waiting for sensor data"
@@ -351,11 +482,23 @@ async def mission_loop(
                 reason=mission_detail,
             )
         elif manual_mode_enabled:
+            avoidance_side_lock = "none"
+            avoidance_clear_cycles_remaining = 0
             mission_state = MissionState.IDLE
             mission_detail = "manual mode enabled"
             desired_command = RuntimeControlCommand(
                 duration_s=command_duration_s,
                 source="manual_mode",
+                reason=mission_detail,
+            )
+        elif not autopilot_enabled:
+            avoidance_side_lock = "none"
+            avoidance_clear_cycles_remaining = 0
+            mission_state = MissionState.IDLE
+            mission_detail = "autopilot disabled"
+            desired_command = RuntimeControlCommand(
+                duration_s=command_duration_s,
+                source="autopilot_toggle",
                 reason=mission_detail,
             )
         elif stale_sensor_names:
@@ -366,9 +509,12 @@ async def mission_loop(
                 source="freshness_guard",
                 reason=mission_detail,
             )
-        elif telemetry is None or frames is None or detection is None or depth_analysis is None:
+        elif telemetry is None or frames is None or detection_for_guidance is None or depth_analysis is None:
             mission_state = MissionState.IDLE
-        elif not detection.detected or detection.marker_id != target_marker_id:
+        elif (
+            not detection_for_guidance.detected
+            or detection_for_guidance.marker_id not in {target_marker_id, locked_target_marker_id}
+        ):
             mission_state = MissionState.SEARCH
             desired_command = RuntimeControlCommand(
                 yaw_rate=float(mission_settings.get("search_yaw_rate_deg_s", 8.0)),
@@ -379,7 +525,7 @@ async def mission_loop(
             mission_detail = desired_command.reason
         else:
             servo_command = visual_servo.compute_command(
-                detection=detection,
+                detection=detection_for_guidance,
                 frame_width=frames.rgb_frame.shape[1],
                 frame_height=frames.rgb_frame.shape[0],
             )
@@ -387,9 +533,48 @@ async def mission_loop(
                 abs(servo_command.error_x_px) <= center_tolerance_px
                 and abs(servo_command.error_y_px) <= center_tolerance_px
             )
-            if auto_descend_on_target and detection.area >= float(
+            if depth_analysis.obstacle_detected or avoidance_side_lock != "none":
+                mission_state = MissionState.TRACK
+                if depth_analysis.obstacle_detected:
+                    avoidance_side_lock = depth_analysis.safer_side
+                    avoidance_clear_cycles_remaining = avoidance_clear_cycles
+                elif avoidance_clear_cycles_remaining > 0:
+                    avoidance_clear_cycles_remaining -= 1
+                else:
+                    avoidance_side_lock = "none"
+
+                if avoidance_side_lock == "none":
+                    desired_command = RuntimeControlCommand(
+                        vx=0.0,
+                        vy=servo_command.vy,
+                        vz=servo_command.vz,
+                        yaw_rate=servo_command.yaw_rate,
+                        duration_s=servo_command.duration_s,
+                        source="mission_loop",
+                        reason="avoidance complete; resume alignment",
+                    )
+                else:
+                    lateral_direction = -1.0 if avoidance_side_lock == "left" else 1.0
+                    avoidance_command = obstacle_avoidance.compute_command(depth_analysis)
+                    desired_command = RuntimeControlCommand(
+                        vx=avoidance_forward_speed_m_s if aligned else 0.0,
+                        vy=lateral_direction * max(abs(avoidance_command.vy), 0.01),
+                        vz=servo_command.vz,
+                        yaw_rate=servo_command.yaw_rate,
+                        duration_s=max(avoidance_command.duration_s, command_duration_s),
+                        source="mission_loop",
+                        reason=(
+                            f"front obstacle; bypass toward {avoidance_side_lock}"
+                            if depth_analysis.obstacle_detected
+                            else f"path clearing; continue bypass toward {avoidance_side_lock}"
+                        ),
+                    )
+                mission_detail = desired_command.reason
+            elif auto_descend_on_target and detection_for_guidance.area >= float(
                 mission_settings.get("descend_marker_area_threshold", 18000.0)
             ):
+                avoidance_side_lock = "none"
+                avoidance_clear_cycles_remaining = 0
                 mission_state = MissionState.DESCEND
                 desired_command = RuntimeControlCommand(
                     vx=0.0,
@@ -402,45 +587,23 @@ async def mission_loop(
                 )
                 mission_detail = desired_command.reason
             elif not aligned:
+                avoidance_side_lock = "none"
+                avoidance_clear_cycles_remaining = 0
                 mission_state = MissionState.TRACK
-                desired_command = RuntimeControlCommand(
-                    vx=0.0,
-                    vy=servo_command.vy,
-                    vz=servo_command.vz,
-                    yaw_rate=servo_command.yaw_rate,
-                    duration_s=servo_command.duration_s,
-                    source="mission_loop",
-                    reason="marker off-center; align before approach",
-                )
-                mission_detail = desired_command.reason
-            elif depth_analysis.obstacle_detected:
-                avoidance_command = obstacle_avoidance.compute_command(depth_analysis)
-                mission_state = MissionState.TRACK
-                desired_command = RuntimeControlCommand(
-                    vx=avoidance_command.vx,
-                    vy=avoidance_command.vy,
-                    vz=avoidance_command.vz,
-                    yaw_rate=avoidance_command.yaw_rate,
-                    duration_s=avoidance_command.duration_s,
-                    source="mission_loop",
-                    reason=f"front obstacle; avoid toward {avoidance_command.chosen_side}",
-                )
-                mission_detail = desired_command.reason
-            elif detection.area < target_marker_area:
-                mission_state = MissionState.TRACK
-                desired_command = RuntimeControlCommand(
-                    vx=forward_speed_m_s,
-                    vy=servo_command.vy,
-                    vz=servo_command.vz,
-                    yaw_rate=servo_command.yaw_rate,
-                    duration_s=command_duration_s,
-                    source="mission_loop",
-                    reason="marker centered and small; approach",
+                desired_command = build_target_tracking_command(
+                    servo_command,
+                    aligned=False,
+                    approach_forward_speed_m_s=forward_speed_m_s,
+                    visible_tracking_forward_speed_m_s=visible_tracking_forward_speed_m_s,
+                    frame_width=frames.rgb_frame.shape[1],
+                    frame_height=frames.rgb_frame.shape[0],
                 )
                 mission_detail = desired_command.reason
             elif auto_land_on_target and telemetry.altitude_m <= float(
                 settings.get("landing", {}).get("touchdown_altitude_m", 0.15)
             ):
+                avoidance_side_lock = "none"
+                avoidance_clear_cycles_remaining = 0
                 mission_state = MissionState.LAND
                 desired_command = RuntimeControlCommand(
                     source="mission_loop",
@@ -448,27 +611,35 @@ async def mission_loop(
                 )
                 mission_detail = desired_command.reason
             else:
+                avoidance_side_lock = "none"
+                avoidance_clear_cycles_remaining = 0
                 mission_state = MissionState.TRACK
-                desired_command = RuntimeControlCommand(
-                    vx=0.0,
-                    vy=servo_command.vy,
-                    vz=0.0,
-                    yaw_rate=servo_command.yaw_rate,
-                    duration_s=command_duration_s,
-                    source="mission_loop",
-                    reason=(
-                        "marker stable near target; hold without auto descend"
-                        if not auto_descend_on_target
-                        else (
-                            "marker stable near target; hold without autoland"
-                            if not auto_land_on_target
-                            else "marker stable; hold alignment"
-                        )
-                    ),
+                desired_command = build_target_tracking_command(
+                    servo_command,
+                    aligned=True,
+                    approach_forward_speed_m_s=forward_speed_m_s,
+                    visible_tracking_forward_speed_m_s=visible_tracking_forward_speed_m_s,
+                    frame_width=frames.rgb_frame.shape[1],
+                    frame_height=frames.rgb_frame.shape[0],
                 )
                 mission_detail = desired_command.reason
 
         async with state_lock:
+            if (
+                autopilot_enabled
+                and detection is not None
+                and detection.detected
+                and detection.marker_id == target_marker_id
+            ):
+                shared_state.local_autopilot_target_locked = True
+                shared_state.local_autopilot_target_marker_id = detection.marker_id
+                shared_state.last_target_detection = detection
+                shared_state.last_target_seen_at_s = now_s
+            elif not autopilot_enabled or manual_mode_enabled:
+                shared_state.local_autopilot_target_locked = False
+                shared_state.local_autopilot_target_marker_id = None
+                shared_state.last_target_detection = None
+                shared_state.last_target_seen_at_s = 0.0
             shared_state.mission_state = mission_state
             shared_state.mission_detail = mission_detail
             shared_state.desired_command = desired_command
@@ -552,7 +723,7 @@ async def control_loop(
             if mission_state == MissionState.LAND and not manual_active:
                 await asyncio.to_thread(adapter.land)
             elif mission_state in {MissionState.IDLE, MissionState.FAILSAFE} and not manual_active:
-                await asyncio.to_thread(adapter.hover)
+                await asyncio.to_thread(adapter.hover, False)
             else:
                 await asyncio.to_thread(
                     adapter.move_by_velocity_body,
@@ -561,6 +732,7 @@ async def control_loop(
                     effective_command.vz,
                     max(effective_command.duration_s, interval_s),
                     effective_command.yaw_rate,
+                    False,
                 )
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             async with state_lock:

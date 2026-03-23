@@ -78,8 +78,8 @@ class LocalWorldState:
     marker_distance_m: float = 0.0
     obstacle_distance_m: float | None = None
     obstacle_side: str = "none"
-    obstacle: LocalObstacleState = field(
-        default_factory=lambda: LocalObstacleState(x_m=3.2, y_m=0.6, radius_m=0.55)
+    obstacles: list[LocalObstacleState] = field(
+        default_factory=lambda: [LocalObstacleState(x_m=3.2, y_m=0.6, radius_m=0.55)]
     )
 
 
@@ -105,6 +105,11 @@ class RuntimeSharedState:
     local_manual_status: str = "auto"
     local_spin_paused: bool = False
     local_manual_mode_enabled: bool = False
+    local_autopilot_enabled: bool = False
+    local_autopilot_target_locked: bool = False
+    local_autopilot_target_marker_id: int | None = None
+    last_target_detection: Any | None = None
+    last_target_seen_at_s: float = 0.0
     shutdown_requested: bool = False
     mission_state: MissionState = MissionState.IDLE
     mission_detail: str = "initializing"

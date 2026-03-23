@@ -35,13 +35,23 @@ dev_ui:
   window_name: "drone_cv dev"
 
 local_world:
-  width_m: 10.0
-  height_m: 8.0
-  marker_x_m: 6.0
+  width_m: 18.0
+  height_m: 12.0
+  marker_x_m: 13.5
   marker_y_m: 0.0
-  obstacle_x_m: 3.2
-  obstacle_y_m: 0.6
-  obstacle_radius_m: 0.55
+  obstacles:
+    - x_m: 3.4
+      y_m: 0.2
+      radius_m: 0.75
+    - x_m: 6.4
+      y_m: -1.6
+      radius_m: 0.95
+    - x_m: 8.9
+      y_m: 1.8
+      radius_m: 0.85
+    - x_m: 11.4
+      y_m: -0.7
+      radius_m: 0.9
   camera_fov_deg: 70.0
   marker_scale_px_m: 260.0
   desired_altitude_m: 1.2
@@ -98,6 +108,8 @@ control:
   approach_center_tolerance_px: 30.0
   approach_target_marker_area: 12000.0
   approach_forward_speed_m_s: 0.2
+  track_visible_forward_speed_m_s: 0.08
+  target_memory_timeout_s: 0.75
   approach_command_duration_s: 0.25
 
 depth:
@@ -130,8 +142,8 @@ overlays:
   mission_state: "idle"
 
 mission:
-  search_yaw_rate_deg_s: 8.0
-  search_step_duration_s: 0.35
+  search_yaw_rate_deg_s: 14.0
+  search_step_duration_s: 0.45
   search_timeout_s: 20.0
   track_timeout_s: 30.0
   total_timeout_s: 90.0
@@ -140,6 +152,8 @@ mission:
   descend_rate_m_s: 0.2
   descend_step_duration_s: 0.25
   auto_descend_on_target: false
+  avoidance_forward_speed_m_s: 0.14
+  avoidance_clear_cycles: 4
   landing_altitude_m: 0.4
   auto_land_on_target: false
   complete_wait_s: 2.0

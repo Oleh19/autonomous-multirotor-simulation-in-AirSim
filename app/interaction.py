@@ -10,7 +10,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.local_runtime import apply_manual_key_input, is_supported_manual_key
+from app.local_runtime import apply_manual_key_input, is_supported_manual_key, normalize_manual_key
 from app.local_world import draw_dev_camera_overlay
 
 
@@ -134,12 +134,15 @@ async def dev_ui_loop(
         )
         cv2.imshow(window_name, frame)
         key = cv2.waitKeyEx(1)
+        normalized_key = normalize_manual_key(key)
 
         if key in {27, ord("q"), ord("Q"), ord("й"), ord("Й")}:
+            async with state_lock:
+                shared_state.shutdown_requested = True
             logger.info("Dev UI loop requested shutdown")
             return
-        if key != -1:
-            await apply_manual_key_input(shared_state, state_lock, key)
+        if normalized_key is not None:
+            await apply_manual_key_input(shared_state, state_lock, normalized_key)
         await asyncio.sleep(interval_s)
 
 
@@ -156,7 +159,7 @@ async def terminal_control_loop(
 
     controls_hint = (
         f"{mode_name} terminal controls: A/D yaw | W/S altitude | I/K forward/back | "
-        "J/L strafe | M manual-only | Space pause auto yaw | Q quit"
+        "J/L strafe | M manual-only | P autopilot | Space pause auto yaw | Q quit"
     )
     controls_hint += " | ru-layout: Ф/В Ц/Ы Ш/Л О/Д Ь"
     if running_in_wsl():

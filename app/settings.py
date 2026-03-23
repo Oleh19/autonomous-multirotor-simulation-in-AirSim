@@ -45,14 +45,21 @@ class UiSection(StrictBaseModel):
     window_name: str = Field(min_length=1)
 
 
+class LocalObstacleSection(StrictBaseModel):
+    x_m: float
+    y_m: float
+    radius_m: float = Field(gt=0.0)
+
+
 class LocalWorldSection(StrictBaseModel):
     width_m: float = Field(gt=0.0)
     height_m: float = Field(gt=0.0)
     marker_x_m: float
     marker_y_m: float
-    obstacle_x_m: float
-    obstacle_y_m: float
-    obstacle_radius_m: float = Field(gt=0.0)
+    obstacle_x_m: float | None = None
+    obstacle_y_m: float | None = None
+    obstacle_radius_m: float | None = Field(default=None, gt=0.0)
+    obstacles: list[LocalObstacleSection] = Field(default_factory=list)
     camera_fov_deg: float = Field(gt=1.0, lt=179.0)
     marker_scale_px_m: float = Field(gt=0.0)
     desired_altitude_m: float = Field(gt=0.0)
@@ -67,6 +74,13 @@ class LocalWorldSection(StrictBaseModel):
             raise ValueError(
                 "local_world.desired_altitude_m must be within [local_world.min_altitude_m, local_world.max_altitude_m]"
             )
+        has_legacy_obstacle = (
+            self.obstacle_x_m is not None
+            and self.obstacle_y_m is not None
+            and self.obstacle_radius_m is not None
+        )
+        if not self.obstacles and not has_legacy_obstacle:
+            raise ValueError("local_world must define either obstacles or legacy obstacle_x/obstacle_y/obstacle_radius")
         return self
 
 
@@ -124,6 +138,8 @@ class ControlSection(StrictBaseModel):
     approach_center_tolerance_px: float = Field(ge=0.0)
     approach_target_marker_area: float = Field(gt=0.0)
     approach_forward_speed_m_s: float = Field(gt=0.0)
+    track_visible_forward_speed_m_s: float = Field(ge=0.0)
+    target_memory_timeout_s: float = Field(ge=0.0)
     approach_command_duration_s: float = Field(gt=0.0)
 
 
@@ -177,6 +193,8 @@ class MissionSection(StrictBaseModel):
     descend_rate_m_s: float = Field(gt=0.0)
     descend_step_duration_s: float = Field(gt=0.0)
     auto_descend_on_target: bool
+    avoidance_forward_speed_m_s: float = Field(ge=0.0)
+    avoidance_clear_cycles: int = Field(ge=0)
     landing_altitude_m: float = Field(gt=0.0)
     auto_land_on_target: bool
     complete_wait_s: float = Field(gt=0.0)

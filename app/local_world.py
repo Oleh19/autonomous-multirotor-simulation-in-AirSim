@@ -2,6 +2,21 @@ from __future__ import annotations
 
 from functools import lru_cache
 import math
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class LocalMarkerProjection:
+    center_x_px: float
+    center_y_px: float
+    marker_size_px: int
+    marker_distance_m: float
+    visible_in_front: bool
+    visible_in_frame: bool
+    clipped_left_px: int
+    clipped_top_px: int
+    clipped_right_px: int
+    clipped_bottom_px: int
 
 
 def apply_local_command(world, command, dt: float) -> None:
@@ -46,6 +61,23 @@ def build_initial_local_world(settings):
     from telemetry.models import LocalObstacleState, LocalWorldState
 
     local_world_settings = settings.get("local_world", {})
+    obstacles_config = local_world_settings.get("obstacles", [])
+    obstacles = [
+        LocalObstacleState(
+            x_m=float(obstacle.get("x_m", 0.0)),
+            y_m=float(obstacle.get("y_m", 0.0)),
+            radius_m=float(obstacle.get("radius_m", 0.5)),
+        )
+        for obstacle in obstacles_config
+    ]
+    if not obstacles:
+        obstacles = [
+            LocalObstacleState(
+                x_m=float(local_world_settings.get("obstacle_x_m", 3.2)),
+                y_m=float(local_world_settings.get("obstacle_y_m", 0.6)),
+                radius_m=float(local_world_settings.get("obstacle_radius_m", 0.55)),
+            )
+        ]
     return LocalWorldState(
         width_m=float(local_world_settings.get("width_m", 10.0)),
         height_m=float(local_world_settings.get("height_m", 8.0)),
@@ -57,11 +89,7 @@ def build_initial_local_world(settings):
         yaw_deg=0.0,
         marker_x_m=float(local_world_settings.get("marker_x_m", 6.0)),
         marker_y_m=float(local_world_settings.get("marker_y_m", 0.0)),
-        obstacle=LocalObstacleState(
-            x_m=float(local_world_settings.get("obstacle_x_m", 3.2)),
-            y_m=float(local_world_settings.get("obstacle_y_m", 0.6)),
-            radius_m=float(local_world_settings.get("obstacle_radius_m", 0.55)),
-        ),
+        obstacles=obstacles,
     )
 
 
@@ -87,11 +115,14 @@ def snapshot_local_world(world):
         marker_distance_m=world.marker_distance_m,
         obstacle_distance_m=world.obstacle_distance_m,
         obstacle_side=world.obstacle_side,
-        obstacle=LocalObstacleState(
-            x_m=world.obstacle.x_m,
-            y_m=world.obstacle.y_m,
-            radius_m=world.obstacle.radius_m,
-        ),
+        obstacles=[
+            LocalObstacleState(
+                x_m=obstacle.x_m,
+                y_m=obstacle.y_m,
+                radius_m=obstacle.radius_m,
+            )
+            for obstacle in world.obstacles
+        ],
     )
 
 
@@ -112,10 +143,77 @@ def _get_marker_bgr(
     import numpy as np
 
     dictionary = _get_aruco_dictionary(dictionary_name)
-    marker = cv2.aruco.generateImageMarker(dictionary, marker_id, marker_size_px)
-    marker_bgr = np.full((marker_size_px, marker_size_px, 3), 255, dtype=np.uint8)
-    marker_bgr[marker == 0] = (70, 170, 70)
-    return marker_bgr
+    quiet_zone_px = max(8, marker_size_px // 8)
+    inner_size_px = max(24, marker_size_px - (quiet_zone_px * 2))
+    marker = np.full((marker_size_px, marker_size_px), 255, dtype=np.uint8)
+    generated = cv2.aruco.generateImageMarker(dictionary, marker_id, inner_size_px)
+    marker[
+        quiet_zone_px : quiet_zone_px + inner_size_px,
+        quiet_zone_px : quiet_zone_px + inner_size_px,
+    ] = generated
+    return np.repeat(marker[:, :, None], 3, axis=2)
+
+
+def project_local_marker(settings, world) -> LocalMarkerProjection:
+    camera_settings = settings.get("camera", {})
+    local_world_settings = settings.get("local_world", {})
+    width = int(camera_settings.get("image_width", 640))
+    height = int(camera_settings.get("image_height", 480))
+    field_of_view_deg = float(local_world_settings.get("camera_fov_deg", 70.0))
+    marker_scale_px_m = float(local_world_settings.get("marker_scale_px_m", 260.0))
+    desired_altitude_m = float(local_world_settings.get("desired_altitude_m", 1.2))
+
+    half_fov_rad = math.radians(field_of_view_deg / 2.0)
+    focal_px = (width / 2.0) / math.tan(half_fov_rad)
+    yaw_rad = math.radians(world.yaw_deg)
+    marker_body_x, marker_body_y = world_to_body(
+        world.marker_x_m - world.drone_x_m,
+        world.marker_y_m - world.drone_y_m,
+        yaw_rad,
+    )
+    marker_distance_m = math.sqrt(marker_body_x ** 2 + marker_body_y ** 2 + world.altitude_m ** 2)
+    visible_in_front = marker_body_x > 0.2
+
+    if not visible_in_front:
+        return LocalMarkerProjection(
+            center_x_px=width / 2.0,
+            center_y_px=height / 2.0,
+            marker_size_px=0,
+            marker_distance_m=marker_distance_m,
+            visible_in_front=False,
+            visible_in_frame=False,
+            clipped_left_px=0,
+            clipped_top_px=0,
+            clipped_right_px=0,
+            clipped_bottom_px=0,
+        )
+
+    marker_size_px = int(max(40.0, min(220.0, marker_scale_px_m / max(marker_distance_m, 0.8))))
+    center_x = float((width / 2.0) + (marker_body_y / max(marker_body_x, 0.2)) * focal_px)
+    vertical_ratio = (world.altitude_m - desired_altitude_m) / max(world.max_altitude_m, 0.1)
+    center_y = float((height / 2.0) + (vertical_ratio * height * 0.7))
+    left = int(round(center_x - (marker_size_px / 2.0)))
+    top = int(round(center_y - (marker_size_px / 2.0)))
+    right = left + marker_size_px
+    bottom = top + marker_size_px
+    clipped_left = max(0, left)
+    clipped_top = max(0, top)
+    clipped_right = min(width, right)
+    clipped_bottom = min(height, bottom)
+    visible_in_frame = clipped_left < clipped_right and clipped_top < clipped_bottom
+
+    return LocalMarkerProjection(
+        center_x_px=center_x,
+        center_y_px=center_y,
+        marker_size_px=marker_size_px,
+        marker_distance_m=marker_distance_m,
+        visible_in_front=True,
+        visible_in_frame=visible_in_frame,
+        clipped_left_px=clipped_left,
+        clipped_top_px=clipped_top,
+        clipped_right_px=clipped_right,
+        clipped_bottom_px=clipped_bottom,
+    )
 
 
 def render_local_world_frame(settings, world):
@@ -123,15 +221,12 @@ def render_local_world_frame(settings, world):
     import numpy as np
 
     aruco_settings = settings.get("aruco", {})
-    camera_settings = settings.get("camera", {})
     local_world_settings = settings.get("local_world", {})
     dictionary_name = str(aruco_settings.get("dictionary", "DICT_4X4_50"))
     marker_id = int(aruco_settings.get("marker_id", 0))
-    width = int(camera_settings.get("image_width", 640))
-    height = int(camera_settings.get("image_height", 480))
+    width = int(settings.get("camera", {}).get("image_width", 640))
+    height = int(settings.get("camera", {}).get("image_height", 480))
     field_of_view_deg = float(local_world_settings.get("camera_fov_deg", 70.0))
-    marker_scale_px_m = float(local_world_settings.get("marker_scale_px_m", 260.0))
-    desired_altitude_m = float(local_world_settings.get("desired_altitude_m", 1.2))
 
     frame = np.full((height, width, 3), 238, dtype=np.uint8)
     depth = np.full((height, width), 8.0, dtype=np.float32)
@@ -141,47 +236,49 @@ def render_local_world_frame(settings, world):
     half_fov_rad = math.radians(field_of_view_deg / 2.0)
     focal_px = (width / 2.0) / math.tan(half_fov_rad)
     yaw_rad = math.radians(world.yaw_deg)
+    marker_projection = project_local_marker(settings, world)
+    marker_distance_m = marker_projection.marker_distance_m
+    marker_visible = marker_projection.visible_in_frame
 
-    marker_body_x, marker_body_y = world_to_body(
-        world.marker_x_m - world.drone_x_m,
-        world.marker_y_m - world.drone_y_m,
-        yaw_rad,
-    )
-    marker_distance_m = math.sqrt(marker_body_x ** 2 + marker_body_y ** 2 + world.altitude_m ** 2)
-    marker_visible = (
-        marker_body_x > 0.35
-        and abs(marker_body_y / max(marker_body_x, 0.35)) <= math.tan(half_fov_rad)
-    )
-
-    if marker_visible:
-        marker_size_px = int(
-            max(40.0, min(220.0, marker_scale_px_m / max(marker_distance_m, 0.8)))
-        )
-        center_x = int(round((width / 2.0) + (marker_body_y / marker_body_x) * focal_px))
-        vertical_ratio = (world.altitude_m - desired_altitude_m) / max(world.max_altitude_m, 0.1)
-        center_y = int(round((height / 2.0) + (vertical_ratio * height * 0.7)))
-        top = center_y - (marker_size_px // 2)
-        left = center_x - (marker_size_px // 2)
-        if top >= 0 and left >= 0 and top + marker_size_px < height and left + marker_size_px < width:
-            marker_bgr = _get_marker_bgr(dictionary_name, marker_id, marker_size_px)
-            frame[top : top + marker_size_px, left : left + marker_size_px] = marker_bgr
+    if marker_projection.visible_in_frame and marker_projection.marker_size_px > 0:
+        marker_bgr = _get_marker_bgr(dictionary_name, marker_id, marker_projection.marker_size_px)
+        left = int(round(marker_projection.center_x_px - (marker_projection.marker_size_px / 2.0)))
+        top = int(round(marker_projection.center_y_px - (marker_projection.marker_size_px / 2.0)))
+        src_left = marker_projection.clipped_left_px - left
+        src_top = marker_projection.clipped_top_px - top
+        src_right = src_left + (marker_projection.clipped_right_px - marker_projection.clipped_left_px)
+        src_bottom = src_top + (marker_projection.clipped_bottom_px - marker_projection.clipped_top_px)
+        frame[
+            marker_projection.clipped_top_px : marker_projection.clipped_bottom_px,
+            marker_projection.clipped_left_px : marker_projection.clipped_right_px,
+        ] = marker_bgr[src_top:src_bottom, src_left:src_right]
 
     obstacle_distance_m = None
     obstacle_side = "none"
-    obstacle_body_x, obstacle_body_y = world_to_body(
-        world.obstacle.x_m - world.drone_x_m,
-        world.obstacle.y_m - world.drone_y_m,
-        yaw_rad,
-    )
-    obstacle_distance_center_m = math.hypot(obstacle_body_x, obstacle_body_y)
-    obstacle_visible = (
-        obstacle_body_x > 0.2
-        and abs(obstacle_body_y / max(obstacle_body_x, 0.2)) <= math.tan(half_fov_rad)
-    )
-    if obstacle_visible:
-        obstacle_side = "right" if obstacle_body_y >= 0.0 else "left"
-        obstacle_distance_m = obstacle_distance_center_m
-        angular_half_width = math.atan2(world.obstacle.radius_m, max(obstacle_body_x, 0.1))
+    nearest_visible_obstacle_distance_m = None
+    for obstacle in world.obstacles:
+        obstacle_body_x, obstacle_body_y = world_to_body(
+            obstacle.x_m - world.drone_x_m,
+            obstacle.y_m - world.drone_y_m,
+            yaw_rad,
+        )
+        obstacle_distance_center_m = math.hypot(obstacle_body_x, obstacle_body_y)
+        obstacle_visible = (
+            obstacle_body_x > 0.2
+            and abs(obstacle_body_y / max(obstacle_body_x, 0.2)) <= math.tan(half_fov_rad)
+        )
+        if not obstacle_visible:
+            continue
+
+        if (
+            nearest_visible_obstacle_distance_m is None
+            or obstacle_distance_center_m < nearest_visible_obstacle_distance_m
+        ):
+            nearest_visible_obstacle_distance_m = obstacle_distance_center_m
+            obstacle_distance_m = obstacle_distance_center_m
+            obstacle_side = "right" if obstacle_body_y >= 0.0 else "left"
+
+        angular_half_width = math.atan2(obstacle.radius_m, max(obstacle_body_x, 0.1))
         obstacle_center_x = int(round((width / 2.0) + (obstacle_body_y / obstacle_body_x) * focal_px))
         obstacle_half_width_px = max(14, int(round(math.tan(angular_half_width) * focal_px)))
         obstacle_top = int(height * 0.22)
@@ -189,8 +286,8 @@ def render_local_world_frame(settings, world):
         left = max(0, obstacle_center_x - obstacle_half_width_px)
         right = min(width, obstacle_center_x + obstacle_half_width_px)
         frame[obstacle_top:obstacle_bottom, left:right] = (70, 95, 155)
-        depth[obstacle_top:obstacle_bottom, left:right] = min(
-            depth[obstacle_top:obstacle_bottom, left:right].min(),
+        depth[obstacle_top:obstacle_bottom, left:right] = np.minimum(
+            depth[obstacle_top:obstacle_bottom, left:right],
             obstacle_body_x,
         )
 
@@ -224,9 +321,6 @@ def draw_local_camera_overlay(
         f"Obstacle: {'yes' if obstacle_detected else 'no'}",
         f"Mission: {mission_detail}",
         f"Command: {command_reason}",
-        "A/D: yaw | W/S: altitude | I/K: forward/back | J/L: strafe",
-        "M: toggle manual-only | Space: toggle auto spin",
-        "Press Q or Esc to close",
     ]
     y = 28
     for line in lines:
@@ -251,6 +345,61 @@ def draw_local_camera_overlay(
             cv2.LINE_AA,
         )
         y += 28
+
+
+def draw_local_help_panel(panel_bgr) -> None:
+    import cv2
+
+    panel_bgr[:] = (236, 239, 233)
+    cv2.line(
+        panel_bgr,
+        (0, 0),
+        (panel_bgr.shape[1], 0),
+        (176, 182, 170),
+        2,
+        cv2.LINE_AA,
+    )
+
+    title_lines = [
+        ("Local controls", 18, 28, 0.7, 2, (28, 28, 28)),
+        ("EN", 18, 58, 0.55, 1, (60, 60, 60)),
+        ("RU layout", 370, 58, 0.55, 1, (60, 60, 60)),
+        ("System", 690, 58, 0.55, 1, (60, 60, 60)),
+    ]
+    for text, x, y, scale, thickness, color in title_lines:
+        cv2.putText(
+            panel_bgr,
+            text,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    help_lines = [
+        ("A/D yaw", 18, 86),
+        ("W/S altitude", 18, 112),
+        ("I/K forward-back", 18, 138),
+        ("J/L strafe", 18, 164),
+        ("M manual-only", 370, 86),
+        ("P autopilot on-off", 370, 112),
+        ("Space auto-spin", 370, 138),
+        ("Ф/В Ц/Ы Ш/Л О/Д Ь З", 370, 164),
+        ("Q or Esc exit", 690, 86),
+    ]
+    for text, x, y in help_lines:
+        cv2.putText(
+            panel_bgr,
+            text,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (28, 28, 28),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def draw_dev_camera_overlay(
@@ -308,14 +457,18 @@ def build_local_ui_canvas(frame_bgr, world, altitude_m: float, mission_state: st
     import numpy as np
 
     panel_width = frame_bgr.shape[1]
+    help_height = 190
     canvas = np.full(
-        (frame_bgr.shape[0], frame_bgr.shape[1] + panel_width, 3),
+        (frame_bgr.shape[0] + help_height, frame_bgr.shape[1] + panel_width, 3),
         248,
         dtype=np.uint8,
     )
-    canvas[:, : frame_bgr.shape[1]] = frame_bgr
-    map_panel = canvas[:, frame_bgr.shape[1] :]
+    content_height = frame_bgr.shape[0]
+    canvas[:content_height, : frame_bgr.shape[1]] = frame_bgr
+    map_panel = canvas[:content_height, frame_bgr.shape[1] :]
     draw_local_world_panel(map_panel, world, altitude_m, mission_state, command, steering_mode)
+    help_panel = canvas[content_height:, :]
+    draw_local_help_panel(help_panel)
     return canvas
 
 
@@ -347,7 +500,6 @@ def draw_local_world_panel(panel_bgr, world, altitude_m: float, mission_state: s
         return px, py
 
     marker_point = to_panel_point(world.marker_x_m, world.marker_y_m)
-    obstacle_point = to_panel_point(world.obstacle.x_m, world.obstacle.y_m)
     drone_point = to_panel_point(world.drone_x_m, world.drone_y_m)
 
     cv2.circle(panel_bgr, marker_point, 12, (20, 120, 40), thickness=2)
@@ -362,18 +514,20 @@ def draw_local_world_panel(panel_bgr, world, altitude_m: float, mission_state: s
         cv2.LINE_AA,
     )
 
-    obstacle_radius_px = max(8, int(round((world.obstacle.radius_m / world_width_m) * map_width)))
-    cv2.circle(panel_bgr, obstacle_point, obstacle_radius_px, (60, 90, 170), thickness=2)
-    cv2.putText(
-        panel_bgr,
-        "obstacle",
-        (obstacle_point[0] + 12, obstacle_point[1] + 4),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (60, 90, 170),
-        1,
-        cv2.LINE_AA,
-    )
+    for index, obstacle in enumerate(world.obstacles, start=1):
+        obstacle_point = to_panel_point(obstacle.x_m, obstacle.y_m)
+        obstacle_radius_px = max(8, int(round((obstacle.radius_m / world_width_m) * map_width)))
+        cv2.circle(panel_bgr, obstacle_point, obstacle_radius_px, (60, 90, 170), thickness=2)
+        cv2.putText(
+            panel_bgr,
+            f"obs {index}",
+            (obstacle_point[0] + 12, obstacle_point[1] + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (60, 90, 170),
+            1,
+            cv2.LINE_AA,
+        )
 
     cv2.circle(panel_bgr, drone_point, 10, (40, 40, 220), thickness=-1)
     heading_end = (

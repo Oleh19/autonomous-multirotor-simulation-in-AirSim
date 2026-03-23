@@ -7,11 +7,6 @@ Create an MVP that connects to AirSim, controls a multirotor drone, reads RGB an
 
 ## Hard constraints
 - Local-only application
-- No database
-- No web frontend
-- No Docker for MVP
-- No ROS 2 for MVP
-- No YOLO or heavy ML for MVP
 - Use AirSim, OpenCV, asyncio, NumPy, PyYAML
 - Keep code modular
 - Keep all magic numbers in config/settings.yaml
@@ -19,40 +14,6 @@ Create an MVP that connects to AirSim, controls a multirotor drone, reads RGB an
 - Do not put all logic into one file
 - Do not replace working code with pseudo-code
 - Do not do speculative refactors unless requested
-
-## Required project structure
-drone_cv/
-  README.md
-  requirements.txt
-  config/
-    settings.yaml
-  app/
-    main.py
-    bootstrap.py
-  adapters/
-    airsim_client.py
-  vision/
-    frame_fetcher.py
-    aruco_detector.py
-    depth_analyzer.py
-    overlays.py
-  control/
-    pid.py
-    visual_servo.py
-    obstacle_avoidance.py
-    landing_controller.py
-  mission/
-    states.py
-    mission_manager.py
-    search_pattern.py
-  telemetry/
-    models.py
-    logger.py
-    recorder.py
-  tests/
-    test_pid.py
-    test_aruco_detector.py
-    test_depth_analyzer.py
 
 ## Architecture rules
 - Keep AirSim API calls only in adapters/airsim_client.py

@@ -63,6 +63,68 @@ else:
     )
 
 
+def initialize_runtime_shared_state(shared_state) -> None:
+    now_s = time.monotonic()
+    shared_state.loop_heartbeats = {loop_name: now_s for loop_name in WATCHDOG_LOOP_NAMES}
+    if not shared_state.local_manual_mode_enabled:
+        shared_state.local_autopilot_enabled = True
+
+
+async def wait_for_runtime_shutdown(
+    shared_state,
+    core_tasks: list[asyncio.Task],
+    interaction_tasks: list[asyncio.Task],
+    logger,
+    run_duration_s: float,
+    poll_interval_s: float = 0.05,
+) -> None:
+    deadline_s = time.monotonic() + run_duration_s
+    active_interaction_tasks = list(interaction_tasks)
+
+    while True:
+        if shared_state.shutdown_requested:
+            return
+
+        for task in core_tasks:
+            if not task.done():
+                continue
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Runtime task '{task.get_name()}' failed: {exc}"
+                ) from exc
+            raise RuntimeError(f"Runtime task '{task.get_name()}' exited unexpectedly")
+
+        remaining_interaction_tasks: list[asyncio.Task] = []
+        for task in active_interaction_tasks:
+            if not task.done():
+                remaining_interaction_tasks.append(task)
+                continue
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                logger.exception(
+                    "Interaction task '%s' failed; runtime will continue without it",
+                    task.get_name(),
+                )
+            else:
+                logger.warning(
+                    "Interaction task '%s' exited; runtime will continue without it",
+                    task.get_name(),
+                )
+        active_interaction_tasks = remaining_interaction_tasks
+
+        if not active_interaction_tasks and time.monotonic() >= deadline_s:
+            return
+
+        await asyncio.sleep(poll_interval_s)
+
+
 async def run_runtime(settings: dict[str, object] | None = None, logger=None) -> int:
     if settings is None or logger is None:
         context = bootstrap_app()
@@ -88,8 +150,7 @@ async def run_runtime(settings: dict[str, object] | None = None, logger=None) ->
     recorder = components["recorder"]
     shared_state = components["shared_state"]
     state_lock = components["state_lock"]
-    now_s = time.monotonic()
-    shared_state.loop_heartbeats = {loop_name: now_s for loop_name in WATCHDOG_LOOP_NAMES}
+    initialize_runtime_shared_state(shared_state)
 
     try:
         await asyncio.to_thread(adapter.connect)
@@ -127,7 +188,7 @@ async def run_runtime(settings: dict[str, object] | None = None, logger=None) ->
     tasks = [
         asyncio.create_task(telemetry_loop(adapter, recorder, shared_state, state_lock, logger, telemetry_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="telemetry"),
         asyncio.create_task(frame_loop(frame_fetcher, shared_state, state_lock, logger, frame_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="frame"),
-        asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, shared_state, state_lock, logger, vision_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="vision"),
+        asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, settings, shared_state, state_lock, logger, vision_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="vision"),
         asyncio.create_task(mission_loop(visual_servo, obstacle_avoidance, recorder, settings, shared_state, state_lock, logger, mission_interval_s), name="mission"),
         asyncio.create_task(control_loop(adapter, safety_limiter, shared_state, state_lock, logger, control_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="control"),
     ]
@@ -167,13 +228,13 @@ async def run_runtime(settings: dict[str, object] | None = None, logger=None) ->
         interaction_tasks.append(terminal_task)
 
     try:
-        if interaction_tasks:
-            done, pending = await asyncio.wait(interaction_tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*done, return_exceptions=True)
-        else:
-            await asyncio.sleep(run_duration_s)
+        await wait_for_runtime_shutdown(
+            shared_state=shared_state,
+            core_tasks=tasks,
+            interaction_tasks=interaction_tasks,
+            logger=logger,
+            run_duration_s=run_duration_s,
+        )
     finally:
         for task in tasks:
             task.cancel()
@@ -216,8 +277,7 @@ async def run_local_runtime(settings: dict[str, object] | None = None, logger=No
 
     shared_state = RuntimeSharedState()
     shared_state.local_world = build_initial_local_world(settings)
-    now_s = time.monotonic()
-    shared_state.loop_heartbeats = {loop_name: now_s for loop_name in WATCHDOG_LOOP_NAMES}
+    initialize_runtime_shared_state(shared_state)
     state_lock = asyncio.Lock()
     recorder = TelemetryRecorder(
         output_dir=Path("artifacts"),
@@ -267,7 +327,7 @@ async def run_local_runtime(settings: dict[str, object] | None = None, logger=No
     tasks = [
         asyncio.create_task(local_telemetry_loop(recorder, shared_state, state_lock, logger, telemetry_interval_s), name="telemetry"),
         asyncio.create_task(local_frame_loop(recorder, settings, shared_state, state_lock, logger, frame_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="frame"),
-        asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, shared_state, state_lock, logger, vision_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="vision"),
+        asyncio.create_task(vision_loop(detector, depth_analyzer, recorder, marker_id, settings, shared_state, state_lock, logger, vision_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="vision"),
         asyncio.create_task(mission_loop(visual_servo, obstacle_avoidance, recorder, settings, shared_state, state_lock, logger, mission_interval_s), name="mission"),
         asyncio.create_task(local_control_loop(safety_limiter, shared_state, state_lock, logger, control_interval_s, profiling_enabled, profiling_warn_threshold_ms), name="control"),
     ]
@@ -307,13 +367,13 @@ async def run_local_runtime(settings: dict[str, object] | None = None, logger=No
         interaction_tasks.append(terminal_task)
 
     try:
-        if interaction_tasks:
-            done, pending = await asyncio.wait(interaction_tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*done, return_exceptions=True)
-        else:
-            await asyncio.sleep(run_duration_s)
+        await wait_for_runtime_shutdown(
+            shared_state=shared_state,
+            core_tasks=tasks,
+            interaction_tasks=interaction_tasks,
+            logger=logger,
+            run_duration_s=run_duration_s,
+        )
     finally:
         for task in tasks:
             task.cancel()

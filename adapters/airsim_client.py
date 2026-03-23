@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import logging
 import re
 from pathlib import Path
+import threading
 from typing import Any
 
 from telemetry.models import Quaternion, TelemetrySnapshot, Vector3
@@ -58,16 +59,19 @@ class AirSimClientAdapter:
         self.logger = logger or logging.getLogger("drone_cv.airsim")
         self._client: Any | None = None
         self._resolved_host = config.host
+        self._last_async_task: Any | None = None
+        self._client_lock = threading.RLock()
 
     def connect(self) -> None:
         client_cls = self._require_airsim()
         resolved_host = self._resolve_host(self.config.host)
         self._resolved_host = resolved_host
-        self._client = client_cls(
-            ip=resolved_host,
-            port=self.config.port,
-            timeout_value=self.config.timeout_seconds,
-        )
+        with self._client_lock:
+            self._client = client_cls(
+                ip=resolved_host,
+                port=self.config.port,
+                timeout_value=self.config.timeout_seconds,
+            )
         self.logger.info(
             "Connecting to AirSim at %s:%s",
             resolved_host,
@@ -81,41 +85,56 @@ class AirSimClientAdapter:
             )
 
     def confirm_connection(self) -> None:
-        client = self._require_client()
-        client.confirmConnection()
+        with self._client_lock:
+            client = self._require_client()
+            client.confirmConnection()
         self.logger.info("AirSim connection confirmed")
 
     def enable_api_control(self, enabled: bool = True) -> None:
-        client = self._require_client()
-        client.enableApiControl(enabled, vehicle_name=self.config.vehicle_name)
+        with self._client_lock:
+            client = self._require_client()
+            client.enableApiControl(enabled, vehicle_name=self.config.vehicle_name)
         self.logger.info("API control set to %s", enabled)
 
     def arm(self, armed: bool = True) -> None:
-        client = self._require_client()
-        client.armDisarm(armed, vehicle_name=self.config.vehicle_name)
+        with self._client_lock:
+            client = self._require_client()
+            client.armDisarm(armed, vehicle_name=self.config.vehicle_name)
         self.logger.info("Arm state set to %s", armed)
 
     def takeoff(self, timeout_seconds: float = 20.0) -> None:
-        client = self._require_client()
         self.logger.info("Takeoff started")
-        client.takeoffAsync(
-            timeout_sec=timeout_seconds,
-            vehicle_name=self.config.vehicle_name,
-        ).join()
+        with self._client_lock:
+            client = self._require_client()
+            self._await_last_async_task_locked()
+            self._last_async_task = client.takeoffAsync(
+                timeout_sec=timeout_seconds,
+                vehicle_name=self.config.vehicle_name,
+            )
+            self._last_async_task.join()
+            self._last_async_task = None
         self.logger.info("Takeoff completed")
 
-    def hover(self) -> None:
-        client = self._require_client()
+    def hover(self, wait: bool = True) -> None:
         self.logger.info("Hover command sent")
-        client.hoverAsync(vehicle_name=self.config.vehicle_name).join()
+        with self._client_lock:
+            client = self._require_client()
+            self._last_async_task = client.hoverAsync(vehicle_name=self.config.vehicle_name)
+            if wait:
+                self._last_async_task.join()
+                self._last_async_task = None
 
     def land(self, timeout_seconds: float = 30.0) -> None:
-        client = self._require_client()
         self.logger.info("Landing started")
-        client.landAsync(
-            timeout_sec=timeout_seconds,
-            vehicle_name=self.config.vehicle_name,
-        ).join()
+        with self._client_lock:
+            client = self._require_client()
+            self._await_last_async_task_locked()
+            self._last_async_task = client.landAsync(
+                timeout_sec=timeout_seconds,
+                vehicle_name=self.config.vehicle_name,
+            )
+            self._last_async_task.join()
+            self._last_async_task = None
         self.logger.info("Landing completed")
 
     def move_by_velocity_body(
@@ -125,8 +144,8 @@ class AirSimClientAdapter:
         vz_m_s: float,
         duration_s: float,
         yaw_rate_deg_s: float,
+        wait: bool = False,
     ) -> None:
-        client = self._require_client()
         airsim_module = self._require_airsim_module()
         self.logger.info(
             "Sending velocity command vx=%.3f vy=%.3f vz=%.3f duration=%.2f yaw_rate=%.3f",
@@ -136,19 +155,25 @@ class AirSimClientAdapter:
             duration_s,
             yaw_rate_deg_s,
         )
-        client.moveByVelocityBodyFrameAsync(
-            vx=vx_m_s,
-            vy=vy_m_s,
-            vz=vz_m_s,
-            duration=duration_s,
-            drivetrain=airsim_module.DrivetrainType.MaxDegreeOfFreedom,
-            yaw_mode=airsim_module.YawMode(is_rate=True, yaw_or_rate=yaw_rate_deg_s),
-            vehicle_name=self.config.vehicle_name,
-        ).join()
+        with self._client_lock:
+            client = self._require_client()
+            self._last_async_task = client.moveByVelocityBodyFrameAsync(
+                vx=vx_m_s,
+                vy=vy_m_s,
+                vz=vz_m_s,
+                duration=duration_s,
+                drivetrain=airsim_module.DrivetrainType.MaxDegreeOfFreedom,
+                yaw_mode=airsim_module.YawMode(is_rate=True, yaw_or_rate=yaw_rate_deg_s),
+                vehicle_name=self.config.vehicle_name,
+            )
+            if wait:
+                self._last_async_task.join()
+                self._last_async_task = None
 
     def get_state(self) -> DroneState:
-        client = self._require_client()
-        state = client.getMultirotorState(vehicle_name=self.config.vehicle_name)
+        with self._client_lock:
+            client = self._require_client()
+            state = client.getMultirotorState(vehicle_name=self.config.vehicle_name)
         kinematics = state.kinematics_estimated
         return DroneState(
             ready=bool(state.ready),
@@ -167,8 +192,9 @@ class AirSimClientAdapter:
         )
 
     def get_telemetry(self) -> TelemetrySnapshot:
-        client = self._require_client()
-        state = client.getMultirotorState(vehicle_name=self.config.vehicle_name)
+        with self._client_lock:
+            client = self._require_client()
+            state = client.getMultirotorState(vehicle_name=self.config.vehicle_name)
         kinematics = state.kinematics_estimated
 
         position = Vector3(
@@ -207,25 +233,26 @@ class AirSimClientAdapter:
         rgb_camera_name: str,
         depth_camera_name: str,
     ) -> AirSimImagePair:
-        client = self._require_client()
         airsim_module = self._require_airsim_module()
-        responses = client.simGetImages(
-            [
-                airsim_module.ImageRequest(
-                    rgb_camera_name,
-                    airsim_module.ImageType.Scene,
-                    pixels_as_float=False,
-                    compress=False,
-                ),
-                airsim_module.ImageRequest(
-                    depth_camera_name,
-                    airsim_module.ImageType.DepthPerspective,
-                    pixels_as_float=True,
-                    compress=False,
-                ),
-            ],
-            vehicle_name=self.config.vehicle_name,
-        )
+        with self._client_lock:
+            client = self._require_client()
+            responses = client.simGetImages(
+                [
+                    airsim_module.ImageRequest(
+                        rgb_camera_name,
+                        airsim_module.ImageType.Scene,
+                        pixels_as_float=False,
+                        compress=False,
+                    ),
+                    airsim_module.ImageRequest(
+                        depth_camera_name,
+                        airsim_module.ImageType.DepthPerspective,
+                        pixels_as_float=True,
+                        compress=False,
+                    ),
+                ],
+                vehicle_name=self.config.vehicle_name,
+            )
         if len(responses) != 2:
             raise RuntimeError(
                 f"Expected 2 AirSim image responses, received {len(responses)}."
@@ -251,6 +278,14 @@ class AirSimClientAdapter:
         if self._client is None:
             raise RuntimeError("AirSim client is not connected. Call connect() first.")
         return self._client
+
+    def _await_last_async_task_locked(self) -> None:
+        if self._last_async_task is None:
+            return
+        try:
+            self._last_async_task.join()
+        finally:
+            self._last_async_task = None
 
     @classmethod
     def _resolve_host(cls, configured_host: str) -> str:
